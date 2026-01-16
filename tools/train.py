@@ -8,6 +8,7 @@ import argparse
 import copy
 import mmcv
 import os
+import sys
 import time
 import torch
 import warnings
@@ -26,6 +27,11 @@ from mmdet.apis import set_random_seed
 from mmseg import __version__ as mmseg_version
 
 from mmcv.utils import TORCH_VERSION, digit_version
+
+
+# Make sure repo root is importable so that `projects.*` plugins can be found.
+# This is important under launchers where PYTHONPATH/CWD may differ.
+sys.path.insert(0, os.getcwd())
 
 
 def parse_args():
@@ -114,10 +120,16 @@ def main():
             import importlib
             if hasattr(cfg, 'plugin_dir'):
                 plugin_dir = cfg.plugin_dir
-                _module_dir = os.path.dirname(plugin_dir)
-                _module_dir = _module_dir.split('/')
-                _module_path = _module_dir[0]
+                # Support both relative and absolute plugin_dir.
+                # The config usually sets plugin_dir='projects/mmdet3d_plugin'.
+                # If plugin_dir is absolute, we still want to import
+                # 'projects.mmdet3d_plugin' instead of raising ModuleNotFoundError.
+                plugin_dir_norm = os.path.normpath(plugin_dir)
+                if os.path.isabs(plugin_dir_norm):
+                    plugin_dir_norm = os.path.relpath(plugin_dir_norm, os.getcwd())
 
+                _module_dir = plugin_dir_norm.split(os.sep)
+                _module_path = _module_dir[0]
                 for m in _module_dir[1:]:
                     _module_path = _module_path + '.' + m
                 print(_module_path)

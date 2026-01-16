@@ -323,13 +323,13 @@ class CustomNuScenesDataset(NuScenesDataset):
         detail['{}/mAP'.format(metric_prefix)] = metrics['mean_ap']
         return detail
 
-    def evaluate_occ_iou(self, occupancy_results, flow_results, show_dir=None, 
+    def evaluate_occ_iou(self, occupancy_results, flow_results, show_dir=None,
                          save_interval=1, occ_threshold=0.25, runner=None):
         """ save the gt_occupancy_sparse and evaluate the iou metrics"""
         assert len(occupancy_results) == len(self)
         thre_str = 'thre_'+'{:.2f}'.format(occ_threshold)
 
-        if show_dir: 
+        if show_dir:
             scene_names = [info['scene_name'] for info in self.data_infos]
             scene_names = np.unique(scene_names)
             save_scene_names = scene_names[:5]
@@ -390,8 +390,25 @@ class CustomNuScenesDataset(NuScenesDataset):
                         np.save(osp.join(occ_gt_save_dir, '{:03d}_flow.npy'.format(frame_idx)), flow_gt_sparse)  
                         np.save(osp.join(occ_pred_save_dir, '{:03d}_flow.npy'.format(frame_idx)), flow_pred_sparse)
                     image_save_path = osp.join(image_save_dir, '{:03d}.png'.format(frame_idx))
-                    if 'surround_image_path' in info:
+                    # Prefer a pre-stitched surround image if present.
+                    if 'surround_image_path' in info and info['surround_image_path']:
                         shutil.copyfile(info['surround_image_path'], image_save_path)
+                    # Fall back to stitching multi-view images into one grid.
+                    elif 'img_filename' in info and info['img_filename']:
+                        try:
+                            import mmcv
+                            from mmcv.visualization.image import concat_images
+
+                            imgs = []
+                            for p in info['img_filename']:
+                                if p and osp.exists(p):
+                                    imgs.append(mmcv.imread(p))
+                            if len(imgs) > 0:
+                                grid = concat_images(imgs, direction='horizontal')
+                                mmcv.imwrite(grid, image_save_path)
+                        except Exception:
+                            # Visualization is optional; ignore any failures here.
+                            pass
 
         eval_resuslt = self.eval_metrics.get_stats()
         print(f'======out evaluation metrics: {thre_str}=========')
@@ -402,6 +419,59 @@ class CustomNuScenesDataset(NuScenesDataset):
         print("iou: {:.2f}".format(eval_resuslt["iou"]))
         print("Precision: {:.4f}".format(eval_resuslt["precision"]))
         print("Recall: {:.4f}".format(eval_resuslt["recall"]))
+
+        # Optionally dump evaluation metrics to disk.
+        # This keeps parity with detection evaluation, which writes
+        # `metrics_summary.json` under the test-time folder.
+        try:
+            import json
+            import time
+
+            # Mirror the folder naming scheme in `tools/test.py`:
+            #   test/<exp_name>/<ctime>/
+            # and write occ metrics under `occ/`.
+            # `tools/test.py` may pass `show_dir` to control output location.
+            if show_dir:
+                occ_out_dir = osp.join(show_dir, thre_str, 'occ_eval')
+            else:
+                # Last resort: write into CWD under a timestamp.
+                occ_out_dir = osp.join('test', 'occ_eval', time.ctime().replace(' ', '_').replace(':', '_'), thre_str)
+
+            os.makedirs(occ_out_dir, exist_ok=True)
+
+            # Convert numpy types to plain python types for JSON.
+            def _to_jsonable(x):
+                try:
+                    import numpy as np
+                    if isinstance(x, np.ndarray):
+                        return x.tolist()
+                    if isinstance(x, (np.floating, np.integer)):
+                        return x.item()
+                except Exception:
+                    pass
+                if isinstance(x, dict):
+                    return {k: _to_jsonable(v) for k, v in x.items()}
+                if isinstance(x, (list, tuple)):
+                    return [_to_jsonable(v) for v in x]
+                return x
+
+            payload = dict(
+                occ_threshold=float(occ_threshold),
+                metrics=_to_jsonable(eval_resuslt),
+            )
+            # Add per-class iou map for easier reading.
+            if hasattr(self, 'occupancy_class_names') and 'iou_ssc' in eval_resuslt:
+                payload['per_class_miou'] = {
+                    str(name): float(eval_resuslt['iou_ssc'][i])
+                    for i, name in enumerate(self.occupancy_class_names)
+                }
+
+            with open(osp.join(occ_out_dir, 'metrics_summary.json'), 'w') as f:
+                json.dump(payload, f, indent=2)
+            print(f'[occ eval] metrics written to: {osp.join(occ_out_dir, "metrics_summary.json")}')
+        except Exception as e:
+            # Metrics dumping is best-effort; do not break evaluation.
+            print(f'[occ eval] skip writing metrics_summary.json due to: {e}')
         
         # flow_distance = eval_resuslt['flow_distance']
         # flow_states=['flow_distance_sta', 'flow_distance_mov', 'flow_distance_all']

@@ -262,8 +262,17 @@ def main():
 
                 eval_kwargs.update(dict(metric=args.eval, **kwargs))
                 if occupancy_results is not None and 'iou' in args.eval:
-                    dataset.evaluate_occ_iou(occupancy_results, flow_results, 
-                                             show_dir=args.show_dir, occ_threshold=occ_threshold)
+                    # Reuse the same prefix folder as detection results so occ
+                    # metrics can be saved alongside `pts_bbox/metrics_summary.json`.
+                    occ_show_dir = args.show_dir
+                    if occ_show_dir is None:
+                        occ_show_dir = kwargs.get('jsonfile_prefix', None)
+
+                    dataset.evaluate_occ_iou(
+                        occupancy_results,
+                        flow_results,
+                        show_dir=occ_show_dir,
+                        occ_threshold=occ_threshold)
                 
                 if 'bbox' in args.eval and bbox_predictions is not None:
                     # evaluate in the whole dataset for NDS

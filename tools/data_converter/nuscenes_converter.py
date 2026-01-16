@@ -199,6 +199,7 @@ def _fill_trainval_infos(nusc,
     val_nusc_infos = []
     frame_idx = 0
     for sample in mmcv.track_iter_progress(nusc.sample):
+        map_location = nusc.get('log', nusc.get('scene', sample['scene_token'])['log_token'])['location']
         lidar_token = sample['data']['LIDAR_TOP']
         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
         cs_record = nusc.get('calibrated_sensor',
@@ -219,6 +220,7 @@ def _fill_trainval_infos(nusc,
             'frame_idx': frame_idx,  # temporal related info
             'sweeps': [],
             'cams': dict(),
+            'map_location': map_location,
             'scene_token': sample['scene_token'],  # temporal related info
             'scene_name': scene_name,
             'lidar2ego_translation': cs_record['translation'],

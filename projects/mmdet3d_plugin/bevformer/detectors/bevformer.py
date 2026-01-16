@@ -46,6 +46,7 @@ class BEVFormer(MVXTwoStageDetector):
                  only_det=True,
                  dataset_type='nuscenes',
                  can_bus_in_dataset=True,
+                 debug_nan=False,
                  ):
 
         super(BEVFormer,
@@ -60,6 +61,7 @@ class BEVFormer(MVXTwoStageDetector):
         self.fp16_enabled = False
         self.dataset_type=dataset_type
         self.can_bus_in_dataset = can_bus_in_dataset
+        self.debug_nan = bool(debug_nan)
 
         # temporal
         self.video_test_mode = video_test_mode
@@ -105,8 +107,48 @@ class BEVFormer(MVXTwoStageDetector):
                 img_feats = list(img_feats.values())
         else:
             return None
+
+        # Numerical stability probe (GPU/FP16 friendly): locate whether NaN/Inf
+        # OR extreme finite values already exist right after backbone / neck.
+        # Enable by setting `debug_nan=True` on the detector in config.
+        if getattr(self, 'debug_nan', False):
+            def _probe(name, x):
+                import torch
+                if not isinstance(x, torch.Tensor):
+                    return
+                with torch.no_grad():
+                    finite = torch.isfinite(x)
+                    ratio = float(finite.float().mean().detach().cpu())
+                    if finite.any():
+                        xf = x[finite]
+                        mn = float(xf.min().detach().cpu())
+                        mx = float(xf.max().detach().cpu())
+                        abs_mx = float(xf.abs().max().detach().cpu())
+                    else:
+                        mn = float('nan')
+                        mx = float('nan')
+                        abs_mx = float('nan')
+
+                    # Print when non-finite exists OR values are dangerously large.
+                    # abs_max threshold is heuristic; for fp16 softmax stability we
+                    # want logits/features far below ~1e4 typically.
+                    if (ratio < 1.0) or (abs_mx > 1e6):
+                        print(
+                            f'[bevformer][probe] {name}: finite_ratio={ratio} '
+                            f'shape={tuple(x.shape)} dtype={x.dtype} device={x.device} '
+                            f'min={mn} max={mx} abs_max={abs_mx}'
+                        )
+
+            if isinstance(img_feats, (list, tuple)):
+                for i, f in enumerate(img_feats):
+                    _probe(f'backbone_out[{i}]', f)
         if self.with_img_neck:
             img_feats = self.img_neck(img_feats)
+
+        if getattr(self, 'debug_nan', False):
+            if isinstance(img_feats, (list, tuple)):
+                for i, f in enumerate(img_feats):
+                    _probe(f'neck_out[{i}]', f)
 
         img_feats_reshaped = []
         for img_feat in img_feats:
@@ -155,6 +197,8 @@ class BEVFormer(MVXTwoStageDetector):
                           occ_gts,
                           flow_gts,
                           img_metas,
+                          gt_map_vecs_label=None,
+                          gt_map_vecs_pts_loc=None,
                           gt_bboxes_ignore=None,
                           prev_bev=None):
         """Forward function'
@@ -186,7 +230,12 @@ class BEVFormer(MVXTwoStageDetector):
                 losses = self.pts_bbox_head.loss_only_occupancy(*loss_inputs, img_metas=img_metas)
             else:
                 loss_inputs = [gt_bboxes_3d, gt_labels_3d, pts_feats, occ_gts, flow_gts, outs]
-                losses = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
+                losses = self.pts_bbox_head.loss(
+                    *loss_inputs,
+                    img_metas=img_metas,
+                    gt_map_vecs_label=gt_map_vecs_label,
+                    gt_map_vecs_pts_loc=gt_map_vecs_pts_loc,
+                )
         return losses
 
     def forward_dummy(self, img):
@@ -316,6 +365,8 @@ class BEVFormer(MVXTwoStageDetector):
                                             gt_bboxes_3d,
                                             gt_labels_3d, occ_gts, flow_gts,
                                             img_metas,
+                                            kwargs.get('gt_map_vecs_label', None),
+                                            kwargs.get('gt_map_vecs_pts_loc', None),
                                             gt_bboxes_ignore, prev_bev)
 
         losses.update(losses_pts)

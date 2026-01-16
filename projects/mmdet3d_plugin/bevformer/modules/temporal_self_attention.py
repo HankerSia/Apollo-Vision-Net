@@ -61,7 +61,9 @@ class TemporalSelfAttention(BaseModule):
                  dropout=0.1,
                  batch_first=True,
                  norm_cfg=None,
-                 init_cfg=None):
+                 init_cfg=None,
+                 attn_logits_clamp=None,
+                 debug_attn_nan=False):
 
         super().__init__(init_cfg)
         if embed_dims % num_heads != 0:
@@ -72,6 +74,11 @@ class TemporalSelfAttention(BaseModule):
         self.dropout = nn.Dropout(dropout)
         self.batch_first = batch_first
         self.fp16_enabled = False
+
+        # Numerical stability (GPU/FP16): optionally clamp attention logits
+        # before softmax to avoid overflow.
+        self.attn_logits_clamp = attn_logits_clamp
+        self.debug_attn_nan = bool(debug_attn_nan)
 
         # you'd better set dim_per_head to a power of 2
         # which is more efficient in the CUDA implementation
@@ -207,7 +214,16 @@ class TemporalSelfAttention(BaseModule):
             bs, num_query, self.num_heads,  self.num_bev_queue, self.num_levels, self.num_points, 2)
         attention_weights = self.attention_weights(query).view(
             bs, num_query,  self.num_heads, self.num_bev_queue, self.num_levels * self.num_points)
+        if self.attn_logits_clamp is not None:
+            c = float(self.attn_logits_clamp)
+            attention_weights = attention_weights.clamp(min=-c, max=c)
         attention_weights = attention_weights.softmax(-1)
+
+        if self.debug_attn_nan and (not torch.isfinite(attention_weights).all()):
+            with torch.no_grad():
+                finite = torch.isfinite(attention_weights)
+                ratio = float(finite.float().mean().detach().cpu())
+                print('[attn][temporal] attention_weights non-finite, ratio=', ratio)
 
         attention_weights = attention_weights.view(bs, num_query,
                                                    self.num_heads,

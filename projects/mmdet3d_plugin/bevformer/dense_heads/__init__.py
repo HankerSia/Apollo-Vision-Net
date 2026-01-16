@@ -3,3 +3,4 @@ from .bevformer_occupancy_head import BEVFormerOccupancyHead
 from .voxelformer_occupancy_head import VoxelFormerOccupancyHead
 from .hybrid_occupancy_head import HybridFormerOccupancyHead
 from .bevformer_occupancy_head_apollo import BEVFormerOccupancyHeadApollo
+from .bevformer_det_map_head_apollo import BEVFormerDetMapHeadApollo

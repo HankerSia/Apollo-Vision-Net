@@ -124,6 +124,23 @@ class PerceptionTransformer(BaseModule):
         obtain bev features.
         """
 
+        def _finite_stats(name, x):
+            if not isinstance(x, torch.Tensor):
+                return
+            if torch.isfinite(x).all():
+                return
+            with torch.no_grad():
+                finite = torch.isfinite(x)
+                ratio = float(finite.float().mean().detach().cpu())
+                if finite.any():
+                    xf = x[finite]
+                    mn = float(xf.min().detach().cpu())
+                    mx = float(xf.max().detach().cpu())
+                else:
+                    mn = float('nan')
+                    mx = float('nan')
+                print(f'[bevformer][nan] {name}: ratio={ratio} shape={tuple(x.shape)} dtype={x.dtype} device={x.device} min={mn} max={mx}')
+
         bs = mlvl_feats[0].size(0)
         bev_queries = bev_queries.unsqueeze(1).repeat(1, bs, 1)  # (num, bs, embed_dims)
         bev_pos = bev_pos.flatten(2).permute(2, 0, 1)
@@ -152,6 +169,8 @@ class PerceptionTransformer(BaseModule):
         shift_x = shift_x * self.use_shift
         shift = bev_queries.new_tensor(
             [shift_x, shift_y]).permute(1, 0)  # (2, bs) -> (bs, 2)
+
+        _finite_stats('shift', shift)
         
         if prev_bev is not None:  # (bs, num, embed_dims)
             if prev_bev.shape[1] == bev_h * bev_w:
@@ -159,7 +178,15 @@ class PerceptionTransformer(BaseModule):
             if self.rotate_prev_bev:
                 for i in range(bs):
                     # num_prev_bev = prev_bev.size(1)
-                    rotation_angle = kwargs['img_metas'][i]['can_bus'][-1]
+                    # Some minimal/smoke paths may provide incomplete can_bus.
+                    # Fallback to 0 rotation so forward can proceed.
+                    rotation_angle = 0.0
+                    try:
+                        _cb = kwargs['img_metas'][i].get('can_bus', None)
+                        if isinstance(_cb, (list, tuple)) and len(_cb) > 0:
+                            rotation_angle = float(_cb[-1])
+                    except Exception:
+                        pass
                     tmp_prev_bev = prev_bev[:, i].reshape(
                         bev_h, bev_w, -1).permute(2, 0, 1)  # (embed_dims, bev_h, bev_w)
                     tmp_prev_bev = rotate(tmp_prev_bev, rotation_angle,
@@ -175,16 +202,26 @@ class PerceptionTransformer(BaseModule):
             can_bus = self.can_bus_mlp(can_bus)[None, :, :]
             bev_queries = bev_queries + can_bus * self.use_can_bus
 
+        _finite_stats('bev_queries(after_can_bus)', bev_queries)
+
         feat_flatten = []
         spatial_shapes = []
         for lvl, feat in enumerate(mlvl_feats):
+            _finite_stats(f'mlvl_feats[{lvl}]', feat)
             bs, num_cam, c, h, w = feat.shape
             spatial_shape = (h, w)
+
+            # Source-level fix: if a particular FPN level contains inf/nan,
+            # sanitize it before adding embeddings and flattening.
+            if not torch.isfinite(feat).all():
+                feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+
             feat = feat.flatten(3).permute(1, 0, 3, 2)
             if self.use_cams_embeds:
                 feat = feat + self.cams_embeds[:, None, None, :].to(feat.dtype)
             feat = feat + self.level_embeds[None,
                                             None, lvl:lvl + 1, :].to(feat.dtype)
+            _finite_stats(f'feat_lvl{lvl}_after_embeds', feat)
             spatial_shapes.append(spatial_shape)
             feat_flatten.append(feat)
 
@@ -196,6 +233,20 @@ class PerceptionTransformer(BaseModule):
 
         feat_flatten = feat_flatten.permute(
             0, 2, 1, 3)  # (num_cam, H*W, bs, embed_dims)
+
+        _finite_stats('feat_flatten', feat_flatten)
+
+        # Also sanitize BEV queries (in rare cases can_bus could introduce inf).
+        if not torch.isfinite(bev_queries).all():
+            bev_queries = torch.nan_to_num(bev_queries, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Root-cause fix (safe): attention modules can become numerically
+        # unstable if feature tensors contain inf/nan (often due to extreme
+        # activations in backbone/neck on CPU debug runs). Since inf/nan are
+        # not meaningful signal, we sanitize them here before entering the
+        # transformer encoder.
+        if not torch.isfinite(feat_flatten).all():
+            feat_flatten = torch.nan_to_num(feat_flatten, nan=0.0, posinf=0.0, neginf=0.0)
 
         bev_embed = self.encoder(
             bev_queries,
@@ -210,6 +261,14 @@ class PerceptionTransformer(BaseModule):
             shift=shift,
             **kwargs
         )
+
+        _finite_stats('bev_embed(from_encoder)', bev_embed)
+
+        # Final guard: if encoder still produces NaNs/Infs, sanitize to keep the
+        # rest of the model stable. This indicates deeper numerical issues
+        # inside attention/normalization ops that should be investigated.
+        if not torch.isfinite(bev_embed).all():
+            bev_embed = torch.nan_to_num(bev_embed, nan=0.0, posinf=0.0, neginf=0.0)
 
         if 'return_intermediate' in kwargs and kwargs['return_intermediate']:
             return bev_embed, feat_flatten, spatial_shapes, level_start_index

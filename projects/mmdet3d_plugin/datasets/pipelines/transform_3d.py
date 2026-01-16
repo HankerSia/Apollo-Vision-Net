@@ -275,7 +275,10 @@ class CustomCollect3D(object):
 
         data['img_metas'] = DC(img_metas, cpu_only=True)
         for key in self.keys:
-            data[key] = results[key]
+            # Some keys (e.g., online-generated map GT) may be injected later
+            # by dataset wrappers. Skip missing keys to avoid hard crashes.
+            if key in results:
+                data[key] = results[key]
         return data
 
     def __repr__(self):

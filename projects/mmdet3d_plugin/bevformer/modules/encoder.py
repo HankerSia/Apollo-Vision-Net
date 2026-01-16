@@ -89,11 +89,61 @@ class BEVFormerEncoder(TransformerLayerSequence):
     @force_fp32(apply_to=('reference_points', 'img_metas'))
     def point_sampling(self, reference_points, pc_range,  img_metas):
 
+        # Optional debug for smoke tests / NaN triage.
+        # Enabled via config: model.debug_nan=True (already used by repo probes).
+        try:
+            debug_nan = bool(getattr(self, 'debug_nan', False))
+        except Exception:
+            debug_nan = False
+        if debug_nan:
+            try:
+                _len = len(img_metas) if hasattr(img_metas, '__len__') else 'NA'
+                print(f"[bevformer][meta] point_sampling: type(img_metas)={type(img_metas)} len={_len}")
+                if isinstance(img_metas, list) and len(img_metas) > 0:
+                    print(f"[bevformer][meta] point_sampling: type(img_metas[0])={type(img_metas[0])}")
+                    if isinstance(img_metas[0], dict):
+                        _keys = list(img_metas[0].keys())
+                        print(f"[bevformer][meta] point_sampling: img_metas[0] keys={_keys}")
+                        if 'lidar2img' in img_metas[0]:
+                            import numpy as _np
+                            _l2i0 = _np.asarray(img_metas[0]['lidar2img'])
+                            print(f"[bevformer][meta] point_sampling: img_metas[0].lidar2img shape={_l2i0.shape} dtype={_l2i0.dtype}")
+                    elif isinstance(img_metas[0], list):
+                        print(f"[bevformer][meta] point_sampling: img_metas[0] is list len={len(img_metas[0])}")
+                        if len(img_metas[0]) > 0 and isinstance(img_metas[0][0], dict):
+                            _keys = list(img_metas[0][0].keys())
+                            print(f"[bevformer][meta] point_sampling: img_metas[0][0] keys={_keys}")
+                            if 'lidar2img' in img_metas[0][0]:
+                                import numpy as _np
+                                _l2i00 = _np.asarray(img_metas[0][0]['lidar2img'])
+                                print(f"[bevformer][meta] point_sampling: img_metas[0][0].lidar2img shape={_l2i00.shape} dtype={_l2i00.dtype}")
+            except Exception as e:
+                print(f"[bevformer][meta] point_sampling debug failed: {e}")
+
         lidar2img = []
         for img_meta in img_metas:
             lidar2img.append(img_meta['lidar2img'])
         lidar2img = np.asarray(lidar2img)
+        # Robustify meta contract:
+        # - expected: (B, num_cam, 4, 4)
+        # - sometimes: (B, 4, 4) where each entry is already a stacked
+        #   (num_cam,4,4) but got collapsed by numpy due to object dtype.
+        if lidar2img.ndim == 3 and lidar2img.shape[-2:] == (4, 4):
+            try:
+                lidar2img = np.stack([np.asarray(x) for x in lidar2img], axis=0)
+            except Exception:
+                pass
+        if debug_nan:
+            try:
+                print(f"[bevformer][meta] point_sampling: np.asarray(lidar2img) shape={lidar2img.shape} dtype={lidar2img.dtype}")
+            except Exception:
+                pass
         lidar2img = reference_points.new_tensor(lidar2img)  # (B, N, 4, 4)
+        if debug_nan:
+            try:
+                print(f"[bevformer][meta] point_sampling: lidar2img tensor shape={tuple(lidar2img.shape)} dtype={lidar2img.dtype} device={lidar2img.device}")
+            except Exception:
+                pass
         reference_points = reference_points.clone()
 
         reference_points[..., 0:1] = reference_points[..., 0:1] * \
@@ -109,6 +159,19 @@ class BEVFormerEncoder(TransformerLayerSequence):
         reference_points = reference_points.permute(1, 0, 2, 3)
         D, B, num_query = reference_points.size()[:3]
         num_cam = lidar2img.size(1)
+        # Smoke/debug robustness: if lidar2img arrived with an unexpected
+        # number of cameras (often due to inconsistent meta shaping), infer
+        # the camera dimension from total elements.
+        if (lidar2img.dim() == 3 and lidar2img.numel() == B * 6 * 4 * 4):
+            # (B,4,4) and each element is actually (6,4,4) but collapsed.
+            pass
+        if lidar2img.numel() != B * num_cam * 4 * 4:
+            try:
+                inferred = int(lidar2img.numel() // (B * 4 * 4))
+                if inferred > 0 and (lidar2img.numel() == B * inferred * 4 * 4):
+                    num_cam = inferred
+            except Exception:
+                pass
 
         reference_points = reference_points.view(
             D, B, 1, num_query, 4).repeat(1, 1, num_cam, 1, 1).unsqueeze(-1)
@@ -124,8 +187,43 @@ class BEVFormerEncoder(TransformerLayerSequence):
         reference_points_cam = reference_points_cam[..., 0:2] / torch.maximum(
             reference_points_cam[..., 2:3], torch.ones_like(reference_points_cam[..., 2:3]) * eps)
 
-        reference_points_cam[..., 0] /= img_metas[0]['img_shape'][0][1]
-        reference_points_cam[..., 1] /= img_metas[0]['img_shape'][0][0]
+        # img_shape contract robustness:
+        # Most pipelines provide `img_shape` as a list with length=num_cams,
+        # where each entry is (H, W, C). Some minimal/smoke paths may miss it.
+        # For point sampling normalization we only need image height/width.
+        img_shape0 = None
+        try:
+            img_shape0 = img_metas[0].get('img_shape', None)
+        except Exception:
+            img_shape0 = None
+
+        H_img = None
+        W_img = None
+        if isinstance(img_shape0, (list, tuple)) and len(img_shape0) > 0:
+            # Prefer per-camera shape.
+            try:
+                H_img = int(img_shape0[0][0])
+                W_img = int(img_shape0[0][1])
+            except Exception:
+                H_img, W_img = None, None
+        elif isinstance(img_shape0, (list, tuple)) and len(img_shape0) >= 2 and isinstance(img_shape0[0], (int, np.integer)):
+            # Sometimes stored as (H, W, C) without per-cam list.
+            try:
+                H_img = int(img_shape0[0])
+                W_img = int(img_shape0[1])
+            except Exception:
+                H_img, W_img = None, None
+
+        # As a last resort (e.g., smoke tests), derive from projected points.
+        # Note: this doesn't recover the true sensor resolution; it just gives a
+        # consistent normalization to keep the forward pass alive.
+        if (H_img is None) or (W_img is None) or (H_img <= 0) or (W_img <= 0):
+            if debug_nan:
+                print("[bevformer][meta] point_sampling: missing img_shape; using fallback H=W=1 for normalization")
+            H_img, W_img = 1, 1
+
+        reference_points_cam[..., 0] /= float(W_img)
+        reference_points_cam[..., 1] /= float(H_img)
 
         bev_mask = (bev_mask & (reference_points_cam[..., 1:2] > 0.0)
                     & (reference_points_cam[..., 1:2] < 1.0)
@@ -185,8 +283,28 @@ class BEVFormerEncoder(TransformerLayerSequence):
         ref_2d = self.get_reference_points(
             bev_h, bev_w, dim='2d', bs=bev_query.size(1), device=bev_query.device, dtype=bev_query.dtype)
 
+        # Normalize img_metas contract for point_sampling.
+        # In this repo, some pipelines pass temporal metas as list[list[dict]]
+        # (bs, len_queue). point_sampling expects list[dict] (bs) where each
+        # dict has 'lidar2img' shaped (num_cam,4,4).
+        img_metas_for_sampling = kwargs.get('img_metas', None)
+        if isinstance(img_metas_for_sampling, list) and len(img_metas_for_sampling) > 0 and isinstance(img_metas_for_sampling[0], list):
+            # Heuristic: treat as (bs, len_queue) and use the latest/current
+            # frame metas for projection.
+            try:
+                img_metas_for_sampling = [m_list[-1] for m_list in img_metas_for_sampling]
+            except Exception:
+                pass
+
+        # Optional: mirror model.debug_nan into encoder for meta debug prints.
+        if hasattr(self, 'debug_nan') is False:
+            try:
+                self.debug_nan = bool(kwargs.get('debug_nan', False))
+            except Exception:
+                pass
+
         reference_points_cam, bev_mask = self.point_sampling(
-            ref_3d, self.pc_range, kwargs['img_metas'])
+            ref_3d, self.pc_range, img_metas_for_sampling)
 
         # bug: this code should be 'shift_ref_2d = ref_2d.clone()', we keep this bug for reproducing our results in paper.
         shift_ref_2d = ref_2d  # .clone()

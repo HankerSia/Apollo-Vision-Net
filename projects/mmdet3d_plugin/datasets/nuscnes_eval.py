@@ -71,6 +71,67 @@ from nuscenes.utils.geometry_utils import view_points
 
 Axis = Any
 
+
+def _safe_nusc_velocity(v) -> np.ndarray:
+    """Coerce velocity to a numpy array with shape (3,).
+
+    NuScenesBox.rotate expects self.velocity to be a 3D vector.
+    Some code paths may produce torch tensors / lists that end up as
+    shape (1,) after implicit conversions.
+    """
+
+    if v is None:
+        return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+    # torch Tensor -> numpy
+    try:
+        import torch  # local import to avoid hard dependency for tooling scripts
+
+        if isinstance(v, torch.Tensor):
+            v = v.detach().cpu().numpy()
+    except Exception:
+        pass
+
+    v = np.asarray(v, dtype=np.float32).reshape(-1)
+    if v.size == 0:
+        return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    if v.size == 1:
+        return np.array([float(v[0]), 0.0, 0.0], dtype=np.float32)
+    if v.size == 2:
+        return np.array([float(v[0]), float(v[1]), 0.0], dtype=np.float32)
+    return np.array([float(v[0]), float(v[1]), float(v[2])], dtype=np.float32)
+
+
+# -----------------------------------------------------------------------------
+# Monkey-patch mmdet3d's NuScenes formatting to be robust to velocity shapes.
+#
+# The default mmdet3d 0.17.1 implementation constructs velocity as
+#   velocity = (*box3d.tensor[i, 7:9], 0.0)
+# which can end up as a malformed array (e.g., shape (1,)) depending on the
+# tensor type / conversion path. That later crashes in NuScenesBox.rotate
+# (np.dot expects a 3-vector).
+# -----------------------------------------------------------------------------
+try:  # pragma: no cover
+    import mmdet3d.datasets.nuscenes_dataset as _nd
+
+    if hasattr(_nd, 'output_to_nusc_box'):
+        _orig_output_to_nusc_box = _nd.output_to_nusc_box
+
+        def _output_to_nusc_box_safe(detection):
+            boxes = _orig_output_to_nusc_box(detection)
+            for b in boxes:
+                # Ensure velocity is a numpy (3,) vector before any rotations.
+                try:
+                    b.velocity = _safe_nusc_velocity(getattr(b, 'velocity', None))
+                except Exception:
+                    # Keep original velocity if anything unexpected happens.
+                    pass
+            return boxes
+
+        _nd.output_to_nusc_box = _output_to_nusc_box_safe
+except Exception:
+    pass
+
 def class_tp_curve(md_list: DetectionMetricDataList,
                    metrics: DetectionMetrics,
                    detection_name: str,

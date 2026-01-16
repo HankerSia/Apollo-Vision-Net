@@ -270,7 +270,7 @@ lr_config = dict(
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3)
-total_epochs = 24
+total_epochs = 100
 evaluation = dict(interval=1, pipeline=test_pipeline)
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
@@ -279,7 +279,11 @@ log_config = dict(
     interval=50,
     hooks=[
         dict(type='TextLoggerHook'),
-        dict(type='TensorboardLoggerHook')
+        # NOTE: Disabled by default to avoid torch.utils.tensorboard importing
+        # distutils.version.LooseVersion on some environments where distutils
+        # is missing/stripped, which causes training to crash before_run.
+        # Re-enable if your environment supports it.
+        # dict(type='TensorboardLoggerHook')
     ])
 
 checkpoint_config = dict(interval=1)

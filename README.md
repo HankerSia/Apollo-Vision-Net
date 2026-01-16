@@ -30,6 +30,7 @@ Our Apollo vision Net proposes several works as follows, significantly improving
 - [Prepare dataset](docs/prepare_dataset.md)
 - [Visualization](docs/visualization.md)
 - [Run the code](docs/run.md)
+- [Blog: v1.0-mini shape debugging (det+occ)](docs/debug_shapes_v1mini_blog.md)
 
 # Results and Pre-trained Models
 

@@ -263,6 +263,7 @@ class BEVFormerOccupancyHeadApollo(BEVFormerOccupancyHead):
             return outs
 
         else:
+            # import pdb; pdb.set_trace()
             outputs = self.transformer(
                 mlvl_feats,
                 bev_queries,
