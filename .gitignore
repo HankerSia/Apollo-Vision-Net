@@ -17,6 +17,9 @@ work_dirs/
 tools_outputs/
 val/
 
+# Local test artifacts
+test/
+
 # Local datasets (usually not committed)
 data/
 
