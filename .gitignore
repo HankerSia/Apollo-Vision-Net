@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+
+# Logs / outputs
+*.log
+
+# Training / experiment artifacts
+work_dirs/
+tools_outputs/
+val/
+
+# Local datasets (usually not committed)
+data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
