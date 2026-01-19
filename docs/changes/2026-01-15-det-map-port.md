@@ -317,3 +317,441 @@ python /home/nuvo/Apollo-Vision-Net/tools/smoke_det_map_forward_train.py \
 - 合同兜底：encoder.point_sampling/transformer rotation_angle/can_bus/img_shape 等，确保 smoke 跑通到 loss。
 - 运行体验：train/test/dist_test/eval 的若干健壮性修补。
 
+---
+
+## 7. 进展回顾（补充：Apollo‑Vision‑Net 接入 MapTR head）
+
+### 7.1 目标与范围
+
+- 目标：在 Apollo‑Vision‑Net 中新增 MapTR 风格 det+map head，并接入 online vector GT，形成可复现的最小训练闭环。
+- 范围：新增 det_map 配置/数据管线/head，打通 GT 透传与 loss；同步加入数值稳定性治本手段（attention logits clamp）与 smoke 验证脚本。
+
+### 7.2 已完成内容（核心链路）
+
+- det_map 配置：`projects/configs/bevformer/bev_tiny_det_map_apollo.py`
+- det_map head：`projects/mmdet3d_plugin/bevformer/dense_heads/bevformer_det_map_head_apollo.py`
+- 数据集扩展：`projects/mmdet3d_plugin/datasets/nuscenes_det_occ_map_dataset.py`
+- online GT pipeline：`projects/mmdet3d_plugin/datasets/pipelines/loading_maptr_gt_det_map.py`
+- 1‑sample smoke：`tools/smoke_det_map_forward_train.py`
+- 完整回顾文档：`docs/changes/2026-01-15-det-map-port.md`
+
+### 7.3 已完成内容（稳定性与兜底）
+
+- 三处 attention softmax 前 logits clamp：spatial / temporal / decoder
+- transformer/encoder 数值 probe 与合同兜底：`lidar2img`、`img_shape`、`can_bus`、temporal metas 等
+- detector → head.loss 透传 map GT 字段：`gt_map_vecs_label`、`gt_map_vecs_pts_loc`
+
+### 7.4 现状结论
+
+- det_map 端到端 smoke 已能稳定输出 loss（闭环达成）
+- clamp 已接入并可配置，具备 FP16/AMP A/B 验证基础
+- 数值 probe 显示上游特征极值仍偏大，需进一步验证 clamp 的治本效果
+
+### 7.5 下一步（主线）
+
+- 在 AMP/FP16 条件下做 clamp A/B 对比，收集 `[bevformer][nan]` ratio/min/max 与 loss 稳定性
+- 在 clamp 证据充分后，逐步回退 transformer 中的临时 `nan_to_num` 兜底
+
+---
+
+## 8. 核心代码摘录（创建/修改重点）
+
+> 说明：以下为关键路径的最小片段，用于让读者快速定位核心逻辑；完整实现以源码为准。
+
+### 8.1 det_map head：MapTR head 模型搭建与最小 loss（新建）
+
+文件：`projects/mmdet3d_plugin/bevformer/dense_heads/bevformer_det_map_head_apollo.py`
+
+#### 8.1.1 头部构造：MapTR 风格 query + cls/pts 预测头
+
+```python
+# --- Map branch (stub, MapTR-aligned) ---
+self.enable_map = kwargs.get('enable_map', True)
+
+# Minimal map prediction heads ("先简后全")
+self.num_map_vec = int(kwargs.get('num_map_vec', 50))
+self.map_num_pts = int(kwargs.get('map_num_pts', kwargs.get('fixed_ptsnum_per_line', 20)))
+self.map_num_classes = int(kwargs.get('map_num_classes', 3))
+
+self.map_query_embed = nn.Embedding(self.num_map_vec, self.embed_dims)
+self.map_cls_head = nn.Sequential(
+  nn.Linear(self.embed_dims, self.embed_dims),
+  nn.ReLU(inplace=True),
+  nn.Linear(self.embed_dims, self.map_num_classes),
+)
+self.map_pts_head = nn.Sequential(
+  nn.Linear(self.embed_dims, self.embed_dims),
+  nn.ReLU(inplace=True),
+  nn.Linear(self.embed_dims, self.map_num_pts * 2),
+)
+```
+
+**说明**：采用 MapTR 的“固定数量 vector queries + cls/pts head”框架；当前是最小可用版，便于先打通数据与 loss 闭环。
+
+#### 8.1.2 Forward：从 BEV 全局特征生成 map 预测
+
+```python
+if self.enable_map:
+  if isinstance(bev_embed, torch.Tensor) and bev_embed.dim() == 3:
+    bev_global = bev_embed.mean(dim=1)  # [bs, C]
+  else:
+    bev_global = mlvl_feats[0].new_zeros((bs, self.embed_dims))
+
+  q = self.map_query_embed.weight.unsqueeze(0).expand(bs, -1, -1)
+  q = q + bev_global.unsqueeze(1)
+  outs['map_cls_logits'] = self.map_cls_head(q)  # [bs, num_vec, C]
+  pts = self.map_pts_head(q).view(bs, self.num_map_vec, self.map_num_pts, 2)
+  outs['map_pts'] = pts
+```
+
+**说明**：用 BEV 全局上下文给 query 加 bias，先做最小化预测，便于后续替换为完整 MapTR decoder。
+
+#### 8.1.3 Loss：GT 容器兼容与“先简后全”闭环
+
+```python
+# Normalize GT container types to per-batch lists
+if not isinstance(gt_map_vecs_label, (list, tuple)):
+  gt_map_vecs_label = [gt_map_vecs_label]
+if not isinstance(gt_map_vecs_pts_loc, (list, tuple)):
+  gt_map_vecs_pts_loc = [gt_map_vecs_pts_loc]
+
+if self.enable_map and (not missing_map_gt):
+  map_cls = outs.get('map_cls_logits', None)
+  map_pts = outs.get('map_pts', None)
+  if isinstance(map_cls, torch.Tensor) and isinstance(map_pts, torch.Tensor):
+    # 对齐前 K 条 GT/Pred，做最小闭环 loss
+    pred_logits = map_cls[b, :K, :]
+    tgt_labels = gt_lab[:K].long().to(pred_logits.device)
+    loss_cls = loss_cls + F.cross_entropy(pred_logits, tgt_labels)
+
+    pred_pts = map_pts[b, :K, :num_pts, :]
+    tgt_pts = gt_pts[:K].to(pred_pts.device)
+    loss_pts = loss_pts + F.l1_loss(pred_pts, tgt_pts)
+```
+
+**说明**：对 GT 形态进行兼容（`LiDARInstanceLines`/list/batch），并以“对齐前 K”方式计算最小 loss，用于验证梯度闭环与训练稳定性。
+
+### 8.2 数据管线：注入 MapTR 在线 GT（新建）
+
+文件：`projects/mmdet3d_plugin/datasets/pipelines/loading_maptr_gt_det_map.py`
+
+```python
+results['gt_map_vecs_label'] = map_labels
+results['gt_map_vecs_pts_loc'] = map_pts
+```
+
+### 8.3 数据集：包装 det/occ → det_map（新建）
+
+文件：`projects/mmdet3d_plugin/datasets/nuscenes_det_occ_map_dataset.py`
+
+```python
+# 在原有 det(+occ) 结果上追加 map GT 字段
+results = super().prepare_train_data(index)
+results.update(map_gt)
+```
+
+### 8.4 Detector：GT 透传到 head.loss（修改）
+
+文件：`projects/mmdet3d_plugin/bevformer/detectors/bevformer.py`
+
+```python
+losses = self.pts_bbox_head.loss(
+  gt_bboxes_3d=gt_bboxes_3d,
+  gt_labels_3d=gt_labels_3d,
+  gt_map_vecs_label=gt_map_vecs_label,
+  gt_map_vecs_pts_loc=gt_map_vecs_pts_loc,
+  img_metas=img_metas,
+)
+```
+
+### 8.5 三处 attention：softmax 前 logits clamp（修改）
+
+文件：
+`projects/mmdet3d_plugin/bevformer/modules/spatial_cross_attention.py`
+`projects/mmdet3d_plugin/bevformer/modules/temporal_self_attention.py`
+`projects/mmdet3d_plugin/bevformer/modules/decoder.py`
+
+```python
+if self.attn_logits_clamp is not None:
+  attention_weights = attention_weights.clamp(
+    -self.attn_logits_clamp, self.attn_logits_clamp
+  )
+attention_weights = attention_weights.softmax(-1)
+```
+
+### 8.6 Transformer/Encoder：合同兜底与 probe（修改）
+
+文件：`projects/mmdet3d_plugin/bevformer/modules/transformer.py`
+
+```python
+def _finite_stats(self, name, x):
+  if x is None:
+    return
+  finite = torch.isfinite(x)
+  ratio = finite.float().mean().item()
+  if ratio < 1.0:
+    print(f"[bevformer][nan] {name}: ratio={ratio} ...")
+```
+
+文件：`projects/mmdet3d_plugin/bevformer/modules/encoder.py`
+
+```python
+if 'img_shape' not in img_meta:
+  img_shape = (1, 1, 3)
+```
+
+### 8.7 1‑sample smoke：最小闭环（新建）
+
+文件：`tools/smoke_det_map_forward_train.py`
+
+```python
+losses = model.forward_train(**data_batch)
+print("=== forward_train losses ===")
+for k, v in losses.items():
+  print(k, float(v))
+```
+
+### 8.8 BEV 查询与位置编码：BEVFormer 兼容的 BEV 生成（新建）
+
+文件：`projects/mmdet3d_plugin/bevformer/dense_heads/bevformer_det_map_head_apollo.py`
+
+```python
+bev_queries = self.bev_embedding.weight.to(dtype)
+bev_mask = torch.zeros((bs, self.bev_h, self.bev_w), device=bev_queries.device).to(dtype)
+bev_pos = self.positional_encoding(bev_mask).to(dtype)
+
+bev_embed = self.transformer.get_bev_features(
+  mlvl_feats,
+  bev_queries,
+  self.bev_h,
+  self.bev_w,
+  grid_length=(self.real_h / self.bev_h, self.real_w / self.bev_w),
+  bev_pos=bev_pos,
+  img_metas=img_metas,
+  prev_bev=prev_bev,
+)
+```
+
+**说明**：该段确保 det_map head 与 BEVFormer 的 temporal `prev_bev` 机制兼容，并输出可缓存的 `bev_embed`。
+
+### 8.9 MapTR 风格 inference hook（新建）
+
+文件：`projects/mmdet3d_plugin/bevformer/dense_heads/bevformer_det_map_head_apollo.py`
+
+```python
+def get_map_results(self, outs, img_metas, **kwargs):
+  bs = len(img_metas)
+  return [dict(vectors=[], scores=[], labels=[]) for _ in range(bs)]
+```
+
+**说明**：预留 MapTR 的向量化解码接口，当前返回空结构以保证推理链路不崩。
+
+### 8.10 Config：启用 det_map head 与 clamp（新建）
+
+文件：`projects/configs/bevformer/bev_tiny_det_map_apollo.py`
+
+```python
+pts_bbox_head=dict(
+  type='BEVFormerDetMapHeadApollo',
+  bev_h=bev_h_,
+  bev_w=bev_w_,
+  embed_dims=_dim_,
+  transformer=dict(
+    type='PerceptionTransformer',
+    encoder=dict(
+      type='BEVFormerEncoder',
+      transformerlayers=dict(
+        attn_cfgs=[
+          dict(type='TemporalSelfAttention', attn_logits_clamp=20.0),
+          dict(
+            type='SpatialCrossAttention',
+            deformable_attention=dict(type='MSDeformableAttention3D', attn_logits_clamp=20.0),
+          ),
+        ],
+      ),
+    ),
+    decoder=None,
+  ),
+  enabling_map=True,
+)
+```
+
+**说明**：配置中直接启用 det_map head，并在两类 attention 中接入 `attn_logits_clamp`，为 FP16 稳定性做治本准备。
+
+### 8.11 在线 MapTR GT：vector 生成与固定采样（新建）
+
+文件：`projects/mmdet3d_plugin/datasets/nuscenes_det_occ_map_dataset.py`
+
+```python
+class LiDARInstanceLines(object):
+  @property
+  def fixed_num_sampled_points(self):
+    distances = np.linspace(0, instance.length, self.fixed_num)
+    sampled_points = np.array([list(instance.interpolate(d).coords) for d in distances]).reshape(-1, 2)
+    # clamp to patch range
+    instance_points_tensor[:, :, 0] = torch.clamp(instance_points_tensor[:, :, 0], min=-self.max_x, max=self.max_x)
+    instance_points_tensor[:, :, 1] = torch.clamp(instance_points_tensor[:, :, 1], min=-self.max_y, max=self.max_y)
+    return instance_points_tensor
+
+class VectorizedLocalMap(object):
+  def gen_vectorized_samples(self, location, lidar2global_translation, lidar2global_rotation):
+    # ... build line/polygon instances per class
+    return dict(gt_vecs_pts_loc=gt_instance_lines, gt_vecs_label=gt_labels)
+```
+
+**说明**：该段提供 MapTR 风格在线 GT 的“固定采样点数 + 类别标签”，并与 det_map head 的最小 loss 对齐。
+
+### 8.12 Pipeline：加载 MapTR GT 并注入 results（新建）
+
+文件：`projects/mmdet3d_plugin/datasets/pipelines/loading_maptr_gt_det_map.py`
+
+```python
+map_gt_path = results.get('map_gt_path', None)
+if map_gt_path is None:
+  raise KeyError('LoadMapTRGTDetMap expects `results[\'map_gt_path\']`.')
+
+data = np.load(map_gt_path, allow_pickle=True)
+pts_key = self.npz_keys['pts']
+label_key = self.npz_keys['label']
+if pts_key not in data or label_key not in data:
+  raise KeyError(
+    f'MapTR map GT npz missing keys: required ({pts_key}, {label_key}), '
+    f'got {list(data.keys())} from {map_gt_path}')
+
+results['map_gts'] = {
+  'gt_vecs_pts_loc': data[pts_key],
+  'gt_vecs_label': data[label_key],
+}
+```
+
+**说明**：该段提供 MapTR GT 的 npz 加载与 key 校验，并把 GT 注入 results，供后续 dataset/pipeline 使用。
+
+### 8.13 数据集：map_location 兜底与在线 GT 入口（新建/修改）
+
+文件：`projects/mmdet3d_plugin/datasets/nuscenes_det_occ_map_dataset.py`
+
+```python
+def _scene_name_to_log_location(scene_name, dataroot, version='v1.0-trainval'):
+  # 旧 infos 缺 map_location 时的兜底查询
+  from nuscenes.nuscenes import NuScenes
+  nusc = NuScenes(version=version, dataroot=dataroot, verbose=False)
+  for s in nusc.scene:
+    if s.get('name') == scene_name:
+      log = nusc.get('log', s['log_token'])
+      return log.get('location')
+  return None
+```
+
+**说明**：当旧版 infos 未提供 `map_location` 时，通过 scene→log 反查 location，保证在线 GT 能选到正确地图。
+
+### 8.14 Collect：缺失 key 跳过，兼容在线 GT 注入（修改）
+
+文件：`projects/mmdet3d_plugin/datasets/pipelines/transform_3d.py`
+
+```python
+for key in self.keys:
+  # Some keys (e.g., online-generated map GT) may be injected later
+  # by dataset wrappers. Skip missing keys to avoid hard crashes.
+  if key in results:
+    data[key] = results[key]
+```
+
+**说明**：允许 dataset 在 `CustomCollect3D` 之后再补充 map GT，避免因 key 缺失导致 pipeline 直接崩溃。
+
+### 8.15 Encoder：lidar2img / img_shape 输入特在数值范围兜底（修改）
+
+文件：`projects/mmdet3d_plugin/bevformer/modules/encoder.py`
+
+```python
+lidar2img = np.asarray(lidar2img)
+if lidar2img.ndim == 3 and lidar2img.shape[-2:] == (4, 4):
+  try:
+    lidar2img = np.stack([np.asarray(x) for x in lidar2img], axis=0)
+  except Exception:
+    pass
+
+if (H_img is None) or (W_img is None) or (H_img <= 0) or (W_img <= 0):
+  H_img, W_img = 1, 1
+```
+
+**说明**：处理 `lidar2img` 维度坍缩与 `img_shape` 缺失问题，让 point_sampling 在 smoke 中可继续执行。
+
+### 8.16 Transformer：can_bus 兜底与 NaN sanitize（修改）
+
+文件：`projects/mmdet3d_plugin/bevformer/modules/transformer.py`
+
+```python
+# Some minimal/smoke paths may provide incomplete can_bus.
+rotation_angle = 0.0
+try:
+  _cb = kwargs['img_metas'][i].get('can_bus', None)
+  if isinstance(_cb, (list, tuple)) and len(_cb) > 0:
+    rotation_angle = float(_cb[-1])
+except Exception:
+  pass
+
+if not torch.isfinite(feat_flatten).all():
+  feat_flatten = torch.nan_to_num(feat_flatten, nan=0.0, posinf=0.0, neginf=0.0)
+
+if not torch.isfinite(bev_embed).all():
+  bev_embed = torch.nan_to_num(bev_embed, nan=0.0, posinf=0.0, neginf=0.0)
+```
+
+**说明**：rotation_angle fallback 保证 temporal BEV 不因 can_bus 缺失而崩；NaN sanitize 用于“先跑通”与定位数值问题（后续会逐步回退）。
+
+### 8.17 Temporal Self-Attention：logits clamp + 非有限检测（修改）
+
+文件：`projects/mmdet3d_plugin/bevformer/modules/temporal_self_attention.py`
+
+```python
+attention_weights = self.attention_weights(query).view(
+  bs, num_query,  self.num_heads, self.num_bev_queue, self.num_levels * self.num_points)
+if self.attn_logits_clamp is not None:
+  c = float(self.attn_logits_clamp)
+  attention_weights = attention_weights.clamp(min=-c, max=c)
+attention_weights = attention_weights.softmax(-1)
+
+if self.debug_attn_nan and (not torch.isfinite(attention_weights).all()):
+  with torch.no_grad():
+    finite = torch.isfinite(attention_weights)
+    ratio = float(finite.float().mean().detach().cpu())
+    print('[attn][temporal] attention_weights non-finite, ratio=', ratio)
+```
+
+**说明**：在 softmax 之前对 logits clamp，配合 `debug_attn_nan` 在 FP16 场景追踪非有限比例。
+
+### 8.18 Decoder Deformable Attention：logits clamp + 非有限检测（修改）
+
+文件：`projects/mmdet3d_plugin/bevformer/modules/decoder.py`
+
+```python
+attention_weights = self.attention_weights(query).view(
+  bs, num_query, self.num_heads, self.num_levels * self.num_points)
+if self.attn_logits_clamp is not None:
+  c = float(self.attn_logits_clamp)
+  attention_weights = attention_weights.clamp(min=-c, max=c)
+attention_weights = attention_weights.softmax(-1)
+
+if self.debug_attn_nan and (not torch.isfinite(attention_weights).all()):
+  with torch.no_grad():
+    finite = torch.isfinite(attention_weights)
+    ratio = float(finite.float().mean().detach().cpu())
+    print('[attn][decoder] attention_weights non-finite, ratio=', ratio)
+```
+
+**说明**：decoder 分支同样 clamp 并打印非有限比例，与 temporal/self 的诊断策略一致。
+
+### 8.19 Spatial Cross-Attention：clamp 开关与稳定性参数（修改）
+
+文件：`projects/mmdet3d_plugin/bevformer/modules/spatial_cross_attention.py`
+
+```python
+def __init__(..., attn_logits_clamp=None, debug_attn_nan=False):
+  # Numerical stability (GPU/FP16): optionally clamp attention logits
+  # before softmax to avoid overflow.
+  self.attn_logits_clamp = attn_logits_clamp
+  self.debug_attn_nan = bool(debug_attn_nan)
+```
+
+**说明**：在 Spatial Cross-Attention 的 3D deformable attention 中新增 clamp 开关与 debug 标记，为与 temporal/decoder 形成一致的可控稳定性策略。
+
