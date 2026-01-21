@@ -104,6 +104,13 @@ class PerceptionTransformer(BaseModule):
         normal_(self.level_embeds)
         if self.use_cams_embeds:
             normal_(self.cams_embeds)
+        # Guard against non-finite init (can happen with bad states in memory)
+        if not torch.isfinite(self.level_embeds).all():
+            self.level_embeds.data = torch.nan_to_num(
+                self.level_embeds.data, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.use_cams_embeds and (not torch.isfinite(self.cams_embeds).all()):
+            self.cams_embeds.data = torch.nan_to_num(
+                self.cams_embeds.data, nan=0.0, posinf=0.0, neginf=0.0)
         if self.use_can_bus:
             xavier_init(self.can_bus_mlp, distribution='uniform', bias=0.)
         if self.decoder is not None:
@@ -206,6 +213,21 @@ class PerceptionTransformer(BaseModule):
 
         feat_flatten = []
         spatial_shapes = []
+        cams_embeds = self.cams_embeds
+        level_embeds = self.level_embeds
+        # If params already contain non-finite values, fix them in-place once.
+        if isinstance(cams_embeds, torch.Tensor) and (not torch.isfinite(cams_embeds).all()):
+            with torch.no_grad():
+                normal_(self.cams_embeds, mean=0.0, std=0.01)
+                self.cams_embeds.data = torch.nan_to_num(
+                    self.cams_embeds.data, nan=0.0, posinf=0.0, neginf=0.0)
+            cams_embeds = self.cams_embeds
+        if isinstance(level_embeds, torch.Tensor) and (not torch.isfinite(level_embeds).all()):
+            with torch.no_grad():
+                normal_(self.level_embeds, mean=0.0, std=0.01)
+                self.level_embeds.data = torch.nan_to_num(
+                    self.level_embeds.data, nan=0.0, posinf=0.0, neginf=0.0)
+            level_embeds = self.level_embeds
         for lvl, feat in enumerate(mlvl_feats):
             _finite_stats(f'mlvl_feats[{lvl}]', feat)
             bs, num_cam, c, h, w = feat.shape
@@ -218,9 +240,9 @@ class PerceptionTransformer(BaseModule):
 
             feat = feat.flatten(3).permute(1, 0, 3, 2)
             if self.use_cams_embeds:
-                feat = feat + self.cams_embeds[:, None, None, :].to(feat.dtype)
-            feat = feat + self.level_embeds[None,
-                                            None, lvl:lvl + 1, :].to(feat.dtype)
+                feat = feat + cams_embeds[:, None, None, :].to(feat.dtype)
+            feat = feat + level_embeds[None,
+                                       None, lvl:lvl + 1, :].to(feat.dtype)
             _finite_stats(f'feat_lvl{lvl}_after_embeds', feat)
             spatial_shapes.append(spatial_shape)
             feat_flatten.append(feat)
