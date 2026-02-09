@@ -399,14 +399,14 @@ class BEVFormer(MVXTwoStageDetector):
             else:
                 img_metas[0][0]['can_bus'][-1] = 0
                 img_metas[0][0]['can_bus'][:3] = 0
-        new_prev_bev, bbox_results, occ_results = self.simple_test(
+        new_prev_bev, bbox_results, occ_results, map_results = self.simple_test(
             img_metas[0], img[0], points, prev_bev=self.prev_frame_info['prev_bev'], **kwargs)
         # During inference, we save the BEV features and ego motion of each timestamp.
         if self.can_bus_in_dataset:
             self.prev_frame_info['prev_pos'] = tmp_pos
             self.prev_frame_info['prev_angle'] = tmp_angle
             self.prev_frame_info['prev_bev'] = new_prev_bev
-        return bbox_results, occ_results
+        return {'bbox_results': bbox_results, 'map_results': map_results}, occ_results
 
     def simple_test_pts(self, x, pts_feats, img_metas, prev_bev=None, rescale=False):
         """Test function"""
@@ -427,7 +427,20 @@ class BEVFormer(MVXTwoStageDetector):
                 bbox3d2result(bboxes, scores, labels)
                 for bboxes, scores, labels in bbox_list
             ]
-        return outs['bev_embed'], bbox_results, occ_results
+        map_results = None
+        if hasattr(self.pts_bbox_head, 'get_map_results'):
+            try:
+                map_results = self.pts_bbox_head.get_map_results(outs, img_metas)
+            except Exception as e:
+                # Avoid spamming logs: only print the first failure.
+                if not hasattr(self, '_map_test_error_printed'):
+                    self._map_test_error_printed = 0
+                if self._map_test_error_printed < 1:
+                    print('[simple_test_pts] get_map_results failed:', repr(e))
+                    self._map_test_error_printed += 1
+                map_results = None
+
+        return outs['bev_embed'], bbox_results, occ_results, map_results
        
     def simple_test(self, img_metas, img=None, points=None, prev_bev=None, rescale=False,
                     occ_threshold=0.25):
@@ -439,20 +452,18 @@ class BEVFormer(MVXTwoStageDetector):
             img_feats = feats
             pts_feats = None
 
-        bbox_list = [dict() for i in range(len(img_metas))]
         result = self.simple_test_pts(
             img_feats, pts_feats, img_metas, prev_bev, rescale=rescale)
         
-        new_prev_bev, bbox_pts, occ_results = result
+        new_prev_bev, bbox_pts, occ_results, map_results = result
         if occ_results['occupancy_preds'] is not None:
             occ_results = self.pts_bbox_head.get_occupancy_prediction(occ_results, occ_threshold)
         
-        if bbox_pts is None:
-            bbox_list = None
-        else:
-            for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
-                result_dict['pts_bbox'] = pts_bbox  # pts_bbox.keys: 'boxes_3d', 'scores_3d', 'labels_3d'
-        return new_prev_bev, bbox_list, occ_results
+        bbox_list = None
+        if bbox_pts is not None:
+            bbox_list = [dict(pts_bbox=pts_bbox) for pts_bbox in bbox_pts]
+
+        return new_prev_bev, bbox_list, occ_results, map_results
         
 
     

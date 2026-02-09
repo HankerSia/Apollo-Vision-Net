@@ -60,6 +60,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, oc
     model.eval()
     bbox_results = []
     mask_results = []
+    map_results = []
     occupancy_results = []
     flow_results = []
     dataset = data_loader.dataset
@@ -76,6 +77,13 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, oc
                     bbox_result = result['bbox_results']
                     batch_size = len(result['bbox_results'])
                     bbox_results.extend(bbox_result)
+                if 'map_results' in result.keys() and result['map_results'] is not None:
+                    # Keep per-sample map predictions in a parallel list.
+                    map_result = result['map_results']
+                    if isinstance(map_result, list):
+                        map_results.extend(map_result)
+                    else:
+                        map_results.append(map_result)
                 if 'mask_results' in result.keys() and result['mask_results'] is not None:
                     mask_result = custom_encode_mask_results(result['mask_results'])
                     mask_results.extend(mask_result)
@@ -111,6 +119,10 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, oc
             mask_results = collect_results_gpu(mask_results, len(dataset))
         else:
             mask_results = None
+        if len(map_results):
+            map_results = collect_results_gpu(map_results, len(dataset))
+        else:
+            map_results = None
     else:
         if len(bbox_results):
             bbox_results = collect_results_cpu(bbox_results, len(dataset), tmpdir)
@@ -121,6 +133,12 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, oc
             mask_results = collect_results_cpu(mask_results, len(dataset), tmpdir)
         else:
             mask_results = None
+
+        if len(map_results):
+            tmpdir = tmpdir + '_map' if tmpdir is not None else None
+            map_results = collect_results_cpu(map_results, len(dataset), tmpdir)
+        else:
+            map_results = None
         
         if len(occupancy_results):
             tmpdir = tmpdir+'_occ' if tmpdir is not None else None
@@ -136,6 +154,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, oc
     
     return {'bbox_results': bbox_results, 
             'mask_results': mask_results, 
+            'map_results': map_results,
             'occupancy_results': occupancy_results,
             'flow_results': flow_results}
 

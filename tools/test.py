@@ -222,32 +222,50 @@ def main():
 
     # add occupancy prediction
     if not distributed:
-        assert False
-        # model = MMDataParallel(model, device_ids=[0])
-        # outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
+        model = MMDataParallel(model, device_ids=[0])
+        outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
+        results = {
+            'bbox_results': outputs,
+            'occupancy_results': None,
+            'flow_results': None,
+        }
+        occ_thresholds = [0.25]
     else:
         model = MMDistributedDataParallel(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
-    
-    occ_thresholds = [0.25]
+        occ_thresholds = [0.25]
+
     for index, occ_threshold in enumerate(occ_thresholds):
-        results = custom_multi_gpu_test(model, data_loader, args.tmpdir,
-                                        args.gpu_collect, occ_threshold)
-        bbox_predictions = results['bbox_results']
-        occupancy_results = results['occupancy_results']
-        flow_results = results['flow_results']
+        if distributed:
+            results = custom_multi_gpu_test(model, data_loader, args.tmpdir,
+                                            args.gpu_collect, occ_threshold)
+
+        bbox_predictions = results.get('bbox_results', None)
+        map_predictions = results.get('map_results', None)
+        occupancy_results = results.get('occupancy_results', None)
+        flow_results = results.get('flow_results', None)
 
         rank, _ = get_dist_info()
         if rank == 0:
             if args.out:
                 print(f'\nwriting results to {args.out}')
-                assert False
+                mmcv.dump(bbox_predictions, args.out)
             
             kwargs = {} if args.eval_options is None else args.eval_options
             kwargs['jsonfile_prefix'] = osp.join('test', args.config.split(
                 '/')[-1].split('.')[-2], time.ctime().replace(' ', '_').replace(':', '_'))
+
+            # Dump map predictions (kept separate from bbox results so bbox eval works).
+            try:
+                if map_predictions is not None:
+                    mmcv.mkdir_or_exist(kwargs['jsonfile_prefix'])
+                    map_dump_path = osp.join(kwargs['jsonfile_prefix'], 'map_results.pkl')
+                    mmcv.dump(map_predictions, map_dump_path)
+                    print(f'\nwriting map results to {map_dump_path}')
+            except Exception as e:
+                print('[test] failed to dump map results:', repr(e))
             if args.format_only and bbox_predictions is not None:
                 dataset.format_results(bbox_predictions, **kwargs)
 
@@ -277,6 +295,14 @@ def main():
                 if 'bbox' in args.eval and bbox_predictions is not None:
                     # evaluate in the whole dataset for NDS
                     print(dataset.evaluate(bbox_predictions, **eval_kwargs))
+
+                # Map-vector evaluation (MapTR protocol) on dumped map_predictions.
+                map_metrics = [m for m in args.eval if m in ['chamfer', 'iou']]
+                if map_predictions is not None and len(map_metrics) > 0:
+                    if hasattr(dataset, 'evaluate_map'):
+                        print(dataset.evaluate_map(map_predictions, metric=map_metrics, **kwargs))
+                    else:
+                        print('[test] dataset has no evaluate_map(); skip map evaluation')
 
 
 if __name__ == '__main__':

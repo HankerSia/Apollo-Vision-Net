@@ -1,6 +1,9 @@
 import numpy as np
 import torch
 import copy
+import os
+import json
+from os import path as osp
 
 import mmcv
 from mmcv.parallel import DataContainer as DC
@@ -16,6 +19,7 @@ from .nuscenes_dataset import CustomNuScenesDataset
 from nuscenes.map_expansion.map_api import NuScenesMap, NuScenesMapExplorer
 from shapely import affinity, ops
 from shapely.geometry import LineString, box, MultiPolygon, MultiLineString
+from shapely.errors import TopologicalError
 
 
 def _scene_name_to_log_location(scene_name: str, dataroot: str, version: str = 'v1.0-trainval'):
@@ -246,7 +250,10 @@ class VectorizedLocalMap(object):
         )
         for record in records:
             line = self.map_explorer[location].map_api.extract_line(record['line_token'])
-            line = line.intersection(patch)
+            try:
+                line = line.intersection(patch)
+            except TopologicalError:
+                continue
             line = self._patch_transform(line, patch_angle, patch_box)
             line_list.append(line)
         return line_list
@@ -274,7 +281,18 @@ class VectorizedLocalMap(object):
                 poly = self.map_explorer[location].map_api.extract_polygon(
                     record['polygon_token']
                 )
-            poly = poly.intersection(patch)
+            # Some nuScenes map polygons are invalid (self-intersection, etc.).
+            # Shapely may throw TopologicalError during intersection; try to
+            # repair with buffer(0) and skip if still failing.
+            try:
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                poly = poly.intersection(patch)
+            except TopologicalError:
+                try:
+                    poly = poly.buffer(0).intersection(patch)
+                except Exception:
+                    continue
             poly = self._patch_transform(poly, patch_angle, patch_box)
             polygons.append(poly)
         return polygons
@@ -290,7 +308,15 @@ class VectorizedLocalMap(object):
         )
         for record in records:
             polygon = self.map_explorer[location].map_api.extract_polygon(record['polygon_token'])
-            polygon = polygon.intersection(patch)
+            try:
+                if not polygon.is_valid:
+                    polygon = polygon.buffer(0)
+                polygon = polygon.intersection(patch)
+            except TopologicalError:
+                try:
+                    polygon = polygon.buffer(0).intersection(patch)
+                except Exception:
+                    continue
             polygon = self._patch_transform(polygon, patch_angle, patch_box)
             polygons.append(polygon)
         return polygons
@@ -386,6 +412,10 @@ class CustomNuScenesDetOccMapDataset(CustomNuScenesDataset):
         map_classes=('divider', 'ped_crossing', 'boundary'),
         fixed_ptsnum_per_line=-1,
         padding_value=-10000,
+        map_ann_file=None,
+        pc_range=None,
+        eval_use_same_gt_sample_num_flag=True,
+        map_eval_nproc=8,
         *args,
         **kwargs,
     ):
@@ -394,8 +424,22 @@ class CustomNuScenesDetOccMapDataset(CustomNuScenesDataset):
         self.padding_value = padding_value
         self.fixed_num = fixed_ptsnum_per_line
 
-        patch_h = self.point_cloud_range[4] - self.point_cloud_range[1]
-        patch_w = self.point_cloud_range[3] - self.point_cloud_range[0]
+        # ---- MapTR-aligned evaluation settings ----
+        self.eval_use_same_gt_sample_num_flag = eval_use_same_gt_sample_num_flag
+        self.map_eval_nproc = int(map_eval_nproc) if map_eval_nproc is not None else 0
+        default_pc_range = getattr(self, 'point_cloud_range', [-50.0, -50.0, -5.0, 50.0, 50.0, 3.0])
+        self.pc_range = list(pc_range) if pc_range is not None else list(default_pc_range)
+        if len(self.pc_range) != 6:
+            raise ValueError(f'pc_range must have 6 numbers, got {self.pc_range}')
+
+        if map_ann_file is None:
+            # Keep MapTR-compatible default filename under the dataset root.
+            data_root = kwargs.get('data_root', 'data/nuscenes/')
+            map_ann_file = osp.join(data_root, 'nuscenes_map_anns_val.json')
+        self.map_ann_file = map_ann_file
+
+        patch_h = self.pc_range[4] - self.pc_range[1]
+        patch_w = self.pc_range[3] - self.pc_range[0]
         self.patch_size = (patch_h, patch_w)
 
         self.vector_map = VectorizedLocalMap(
@@ -405,6 +449,254 @@ class CustomNuScenesDetOccMapDataset(CustomNuScenesDataset):
             fixed_ptsnum_per_line=fixed_ptsnum_per_line,
             padding_value=self.padding_value,
         )
+
+    # ---------------- MapTR-style map evaluation ----------------
+
+    def evaluate_map(
+        self,
+        results,
+        metric='chamfer',
+        logger=None,
+        jsonfile_prefix=None,
+        **kwargs,
+    ):
+        """Evaluate vector-map predictions using MapTR protocol.
+
+        Args:
+            results: list of per-sample map predictions.
+            metric: 'chamfer', 'iou' or list of them.
+            jsonfile_prefix: output directory (same style as detection).
+
+        Returns:
+            dict: metric name -> value
+        """
+
+        if results is None:
+            return {}
+        if jsonfile_prefix is None:
+            jsonfile_prefix = osp.join('test', 'map_results')
+
+        result_path = self.format_map_results(results, jsonfile_prefix=jsonfile_prefix)
+        return self._evaluate_map_single(result_path, metric=metric, logger=logger)
+
+    def _evaluate_map_single(self, result_path: str, metric='chamfer', logger=None):
+        from .map_utils.mean_ap import eval_map
+        from .map_utils.mean_ap import format_res_gt_by_classes
+
+        result_path = osp.abspath(result_path)
+
+        if not osp.exists(self.map_ann_file):
+            self._format_map_gt()
+
+        with open(result_path, 'r') as f:
+            pred_results = json.load(f)
+        gen_results = pred_results['results']
+
+        with open(self.map_ann_file, 'r') as ann_f:
+            gt_anns = json.load(ann_f)
+        annotations = gt_anns['GTs']
+
+        cls_gens, cls_gts = format_res_gt_by_classes(
+            result_path,
+            gen_results,
+            annotations,
+            cls_names=self.MAPCLASSES,
+            num_pred_pts_per_instance=self.fixed_num,
+            eval_use_same_gt_sample_num_flag=self.eval_use_same_gt_sample_num_flag,
+            pc_range=self.pc_range,
+            nproc=max(self.map_eval_nproc, 0),
+        )
+
+        metrics = metric if isinstance(metric, (list, tuple)) else [metric]
+        allowed_metrics = ['chamfer', 'iou']
+        for m in metrics:
+            if m not in allowed_metrics:
+                raise KeyError(f'metric {m} is not supported, allowed: {allowed_metrics}')
+
+        detail = {}
+        for m in metrics:
+            if m == 'chamfer':
+                thresholds = [0.5, 1.0, 1.5]
+            else:
+                thresholds = np.linspace(
+                    0.5, 0.95, int(np.round((0.95 - 0.5) / 0.05)) + 1, endpoint=True
+                ).tolist()
+
+            cls_aps = np.zeros((len(thresholds), len(self.MAPCLASSES)), dtype=np.float64)
+            for i, thr in enumerate(thresholds):
+                mAP, cls_ap = eval_map(
+                    gen_results,
+                    annotations,
+                    cls_gens,
+                    cls_gts,
+                    threshold=float(thr),
+                    cls_names=self.MAPCLASSES,
+                    logger=logger,
+                    num_pred_pts_per_instance=self.fixed_num,
+                    pc_range=self.pc_range,
+                    metric=m,
+                    nproc=max(self.map_eval_nproc, 0),
+                )
+                for j in range(len(self.MAPCLASSES)):
+                    cls_aps[i, j] = float(cls_ap[j]['ap'])
+
+            for j, name in enumerate(self.MAPCLASSES):
+                detail[f'NuscMap_{m}/{name}_AP'] = float(cls_aps.mean(axis=0)[j])
+            detail[f'NuscMap_{m}/mAP'] = float(cls_aps.mean(axis=0).mean())
+
+        return detail
+
+    def format_map_results(self, results, jsonfile_prefix: str):
+        """Write predictions to MapTR-compatible json format."""
+        mmcv.mkdir_or_exist(jsonfile_prefix)
+        res_path = osp.join(jsonfile_prefix, 'nuscmap_results.json')
+
+        pred_annos = []
+        for sample_id, det in enumerate(results):
+            sample_token = self.data_infos[sample_id]['token']
+            pred_anno = {'sample_token': sample_token}
+
+            vec_list = self._map_det_to_vector_list(det)
+
+            pred_vec_list = []
+            for vec in vec_list:
+                label = int(vec['label'])
+                if label < 0 or label >= len(self.MAPCLASSES):
+                    continue
+                pred_vec_list.append(
+                    dict(
+                        pts=np.asarray(vec['pts'], dtype=np.float32),
+                        pts_num=int(len(vec['pts'])),
+                        cls_name=self.MAPCLASSES[label],
+                        type=label,
+                        confidence_level=float(vec.get('score', 0.0)),
+                    )
+                )
+
+            pred_anno['vectors'] = pred_vec_list
+            pred_annos.append(pred_anno)
+
+        nusc_submissions = {'meta': getattr(self, 'modality', {}), 'results': pred_annos}
+        mmcv.dump(nusc_submissions, res_path)
+        return res_path
+
+    def _map_det_to_vector_list(self, det):
+        """Normalize map prediction for a single sample into a list of vectors."""
+        if det is None:
+            return []
+
+        # Already vector-list format.
+        if isinstance(det, dict) and isinstance(det.get('vectors', None), list):
+            if len(det['vectors']) == 0:
+                return []
+            if isinstance(det['vectors'][0], dict):
+                return det['vectors']
+
+        if not isinstance(det, dict):
+            raise TypeError(f'Unsupported map det type: {type(det)}')
+
+        vectors = det.get('vectors', None)
+        scores = det.get('scores', None)
+        labels = det.get('labels', None)
+
+        if vectors is None or scores is None or labels is None:
+            return []
+
+        vectors = np.asarray(vectors)
+        scores = np.asarray(scores).reshape(-1)
+        labels = np.asarray(labels).reshape(-1)
+
+        if vectors.ndim != 3 or vectors.shape[-1] != 2:
+            raise ValueError(f'Expected vectors with shape (N,P,2), got {vectors.shape}')
+
+        out = []
+        n = int(min(vectors.shape[0], scores.shape[0], labels.shape[0]))
+        for i in range(n):
+            out.append(
+                {
+                    'label': int(labels[i]),
+                    'score': float(scores[i]),
+                    'pts': vectors[i],
+                }
+            )
+        return out
+
+    def _format_map_gt(self):
+        """Generate GT map annotations json compatible with MapTR evaluator."""
+        assert self.map_ann_file is not None
+        mmcv.mkdir_or_exist(osp.dirname(self.map_ann_file))
+
+        gt_annos = []
+        dataset_length = len(self)
+        prog_bar = mmcv.ProgressBar(dataset_length)
+
+        for sample_id in range(dataset_length):
+            info = self.data_infos[sample_id]
+            sample_token = info['token']
+
+            location = self._resolve_map_location_from_info(info)
+
+            lidar2ego = np.eye(4)
+            lidar2ego[:3, :3] = Quaternion(info['lidar2ego_rotation']).rotation_matrix
+            lidar2ego[:3, 3] = np.array(info['lidar2ego_translation'])
+
+            ego2global = np.eye(4)
+            ego2global[:3, :3] = Quaternion(info['ego2global_rotation']).rotation_matrix
+            ego2global[:3, 3] = np.array(info['ego2global_translation'])
+
+            lidar2global = ego2global @ lidar2ego
+            lidar2global_translation = list(lidar2global[:3, 3])
+            lidar2global_rotation = list(Quaternion(matrix=lidar2global).q)
+
+            anns_results = self.vector_map.gen_vectorized_samples(
+                location, lidar2global_translation, lidar2global_rotation
+            )
+
+            gt_labels = anns_results.get('gt_vecs_label', [])
+            gt_lines = []
+            gt_inst = anns_results.get('gt_vecs_pts_loc', [])
+            if isinstance(gt_inst, LiDARInstanceLines):
+                gt_lines = gt_inst.instance_list
+
+            gt_vec_list = []
+            for gt_label, gt_vec in zip(gt_labels, gt_lines):
+                gt_label = int(gt_label)
+                if gt_label < 0 or gt_label >= len(self.MAPCLASSES):
+                    continue
+                pts = np.asarray(list(gt_vec.coords), dtype=np.float32)
+                gt_vec_list.append(
+                    dict(
+                        pts=pts,
+                        pts_num=int(pts.shape[0]),
+                        cls_name=self.MAPCLASSES[gt_label],
+                        type=gt_label,
+                    )
+                )
+
+            gt_annos.append({'sample_token': sample_token, 'vectors': gt_vec_list})
+            prog_bar.update()
+
+        mmcv.dump({'GTs': gt_annos}, self.map_ann_file)
+
+    def _resolve_map_location_from_info(self, info: dict):
+        """Resolve nuScenes map location for one sample info."""
+        if info.get('map_location', None) is not None:
+            return info['map_location']
+
+        scene_name = info.get('scene_name', None)
+        if isinstance(scene_name, str) and scene_name:
+            location = scene_name
+            if scene_name.startswith('scene-'):
+                version = None
+                if isinstance(getattr(self, 'metadata', None), dict):
+                    version = self.metadata.get('version', None)
+                version = version or 'v1.0-trainval'
+                resolved = _scene_name_to_log_location(scene_name, self.data_root, version=version)
+                if resolved is not None:
+                    location = resolved
+            return location
+
+        raise KeyError('Missing map_location/scene_name in data_infos for map GT formatting')
 
     def _add_vectormap_gt(self, example, input_dict):
         # Prefer map_location from infos; fall back to nuScenes scene name.
