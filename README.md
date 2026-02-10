@@ -202,6 +202,11 @@ PY
 
 若提示 dataset/head “not in registry”，优先检查 cfg 是否启用了 `plugin=True`，以及你的 `PYTHONPATH` 是否包含仓库根目录。
 
+训练测试:
+```bash
+conda activate apollo_vnet && ./tools/dist_test.sh ./projects/configs/bevformer/bev_tiny_det_map_apollo.py ./ckpts/depth_pretrained_dla34-y1urdmir-20210422_165446-model_final-remapped_bev.pth 1
+```
+
 <a id="section-1-goals"></a>
 ## 1.目标、边界与关键工程决策
 
