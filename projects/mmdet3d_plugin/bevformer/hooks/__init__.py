@@ -1,1 +1,2 @@
 from .custom_hooks import TransferWeight
+from .det_map_text_logger_hook import DetMapTextLoggerHook

@@ -19,7 +19,9 @@ find_unused_parameters = True
 
 # Workaround: this env's `torch.utils.tensorboard` import fails because
 # `distutils.version` is missing. For smoke-train we only keep text logging.
-log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
+# Use a smaller interval to quickly observe det/map loss magnitudes.
+# Use a custom hook to split det/map losses by line and hide disabled losses.
+log_config = dict(interval=10, hooks=[dict(type='DetMapTextLoggerHook')])
 
 point_cloud_range = [-50.0, -50.0, -5.0, 50.0, 50.0, 3.0]
 voxel_size = [0.2, 0.2, 8]
@@ -191,6 +193,32 @@ model = dict(
             loss_iou=dict(type='GIoULoss', loss_weight=0.0),
             enabling_det=True,
             enabling_map=True,
+            # Strategy B: use MapTR-official assigner/targets/loss implementation.
+            map_loss_impl='maptr_official',
+            map_gt_shift_pts_pattern='v2',
+            map_dir_interval=1,
+            map_loss_pts=dict(type='PtsL1Loss', loss_weight=5.0),
+            map_loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.005),
+            map_assigner=dict(
+                type='MapTRAssigner',
+                cls_cost=dict(type='FocalLossCost', weight=2.0),
+                reg_cost=dict(type='BBoxL1Cost', weight=0.0, box_format='xywh'),
+                iou_cost=dict(type='IoUCost', iou_mode='giou', weight=0.0),
+                pts_cost=dict(type='OrderedPtsL1Cost', weight=5.0),
+                pc_range=point_cloud_range,
+            ),
+            # MapTR-aligned vector protocol
+            num_map_vec=50,
+            map_num_classes=3,
+            map_num_pts=20,  # must match dataset fixed_ptsnum_per_line
+            map_pts_weight=5.0,
+            map_focal_weight=1.0,
+            map_pts_normalize='sigmoid',
+            map_matcher_type='hungarian',
+            map_pts_cost_type='chamfer',
+            map_iou_linewidth=1.0,
+            map_cost_cls=1.0,
+            map_cost_pts=1.0,
             real_h=100.0,
             real_w=100.0,
         )
