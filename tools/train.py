@@ -228,7 +228,8 @@ def main():
         test_cfg=cfg.get('test_cfg'))
     model.init_weights()
 
-    logger.info(f'Model:\n{model}')
+    if cfg.get('log_model_summary', True):
+        logger.info(f'Model:\n{model}')
     datasets = [build_dataset(cfg.data.train)]
     if len(cfg.workflow) == 2:
         val_dataset = copy.deepcopy(cfg.data.val)

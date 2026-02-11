@@ -233,13 +233,38 @@ def main():
     #   img: (bs, len_queue, num_cams, C, H, W)
     # Some pipelines yield (bs, num_cams, C, H, W) for single frame.
     if 'img' in batch and isinstance(batch['img'], torch.Tensor):
+        # Derive expected (bs, len_queue) from img_metas when possible.
+        bs_meta = None
+        len_queue_meta = None
+        try:
+            metas = batch.get('img_metas', None)
+            if isinstance(metas, list) and len(metas) > 0:
+                bs_meta = len(metas)
+                if isinstance(metas[0], list):
+                    len_queue_meta = len(metas[0])
+        except Exception:
+            bs_meta = None
+            len_queue_meta = None
+
         # Common cases:
         # - (num_cams, C, H, W)  -> add bs
         # - (bs, num_cams, C, H, W) -> add len_queue
         if batch['img'].dim() == 4:
             batch['img'] = batch['img'].unsqueeze(0)
         if batch['img'].dim() == 5:
-            batch['img'] = batch['img'].unsqueeze(1)
+            # Ambiguous: could be (bs, num_cams, C, H, W) or (len_queue, num_cams, C, H, W).
+            # Prefer trusting img_metas if it indicates a temporal queue.
+            if (bs_meta == 1) and (len_queue_meta is not None) and (batch['img'].size(0) == len_queue_meta):
+                # Treat as (len_queue, num_cams, C, H, W)
+                batch['img'] = batch['img'].unsqueeze(0)
+            else:
+                # Treat as (bs, num_cams, C, H, W)
+                batch['img'] = batch['img'].unsqueeze(1)
+
+        if batch['img'].dim() == 6 and (bs_meta is not None) and (len_queue_meta is not None):
+            # If produced as (len_queue, bs, ...), swap to (bs, len_queue, ...)
+            if batch['img'].size(0) == len_queue_meta and batch['img'].size(1) == bs_meta:
+                batch['img'] = batch['img'].permute(1, 0, 2, 3, 4, 5).contiguous()
 
     # BEVFormer forward_train slices prev_img = img[:, :-1].
     # If len_queue==1, prev_img is empty and downstream reshape breaks.
@@ -378,6 +403,91 @@ def main():
                         print(f"[nan-trace] img_feats[{i}]: nonfinite_ratio={ratio:.6f} shape={shape} dtype={dtype} device={device} min={t_min} max={t_max}")
     except Exception as e:
         print(f"[nan-trace] extract_feat check failed: {e}")
+
+    # ---- Ensure det GT box type matches BEVFormer loss contract ----
+    # BEVFormer det loss expects `gt_bboxes_3d` to be a list of BaseInstance3DBoxes
+    # (with `.gravity_center` and `.tensor`). Some datasets/pipelines provide
+    # tensors; the official dataloader would wrap them via `box_type_3d`.
+    def _meta_for_sample(img_metas, sample_idx: int):
+        try:
+            m = img_metas[sample_idx]
+            if isinstance(m, list) and len(m) > 0 and isinstance(m[-1], dict):
+                return m[-1]
+            if isinstance(m, dict):
+                return m
+        except Exception:
+            pass
+        return {}
+
+    def _wrap_3d_boxes(box_tensor_or_obj, meta: dict):
+        if hasattr(box_tensor_or_obj, 'gravity_center') and hasattr(box_tensor_or_obj, 'tensor'):
+            return box_tensor_or_obj
+        if not isinstance(box_tensor_or_obj, torch.Tensor):
+            return box_tensor_or_obj
+
+        box_dim = int(box_tensor_or_obj.size(-1)) if box_tensor_or_obj.numel() > 0 else int(box_tensor_or_obj.size(-1))
+        box_type = meta.get('box_type_3d', None)
+        if callable(box_type):
+            try:
+                return box_type(box_tensor_or_obj, box_dim)
+            except TypeError:
+                # Some box constructors use different kwarg names; fall back.
+                pass
+            except Exception:
+                pass
+
+        try:
+            from mmdet3d.core.bbox.structures import LiDARInstance3DBoxes
+
+            return LiDARInstance3DBoxes(box_tensor_or_obj, box_dim=box_dim)
+        except Exception as e:
+            # Keep running, but surface why wrapping failed.
+            try:
+                print(
+                    f"[smoke][det] failed to wrap gt_bboxes_3d tensor into LiDARInstance3DBoxes: {e} "
+                    f"shape={tuple(box_tensor_or_obj.shape)} dtype={box_tensor_or_obj.dtype} device={box_tensor_or_obj.device} "
+                    f"meta_keys={list(meta.keys())[:10]}"
+                )
+            except Exception:
+                pass
+            return box_tensor_or_obj
+
+    if 'gt_bboxes_3d' in batch and 'img_metas' in batch:
+        gt_b = batch['gt_bboxes_3d']
+        metas = batch['img_metas']
+        # Normalize to list per sample.
+        # When using a real DataLoader, `DataContainer(cpu_only=True)` would
+        # collate into a list of length bs; since we bypass collate here, wrap
+        # single-sample objects manually.
+        if not isinstance(gt_b, (list, tuple)):
+            gt_b = [gt_b]
+
+        # Same for labels if present (BEVFormer loss expects list[Tensor]).
+        if 'gt_labels_3d' in batch and not isinstance(batch['gt_labels_3d'], (list, tuple)):
+            batch['gt_labels_3d'] = [batch['gt_labels_3d']]
+
+        if isinstance(gt_b, (list, tuple)):
+            wrapped = []
+            for i, b in enumerate(gt_b):
+                meta_i = _meta_for_sample(metas, i) if isinstance(metas, list) else {}
+                if isinstance(b, torch.Tensor):
+                    try:
+                        print(f"[smoke][det] gt_bboxes_3d[{i}] tensor shape={tuple(b.shape)} dtype={b.dtype} device={b.device}")
+                    except Exception:
+                        pass
+                wrapped.append(_wrap_3d_boxes(b, meta_i))
+            batch['gt_bboxes_3d'] = wrapped
+
+        # Debug: verify wrapping result
+        try:
+            if isinstance(batch.get('gt_bboxes_3d', None), (list, tuple)):
+                for i, b in enumerate(batch['gt_bboxes_3d']):
+                    print(
+                        f"[smoke][det] gt_bboxes_3d[{i}] type={type(b).__name__} "
+                        f"has_gravity_center={hasattr(b, 'gravity_center')} has_tensor={hasattr(b, 'tensor')}"
+                    )
+        except Exception:
+            pass
 
     with torch.no_grad():
         losses = model.forward_train(**batch)
