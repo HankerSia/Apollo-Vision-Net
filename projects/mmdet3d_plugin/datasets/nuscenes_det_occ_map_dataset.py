@@ -74,6 +74,24 @@ class LiDARInstanceLines(object):
         self.instance_list = instance_line_list
 
     @property
+    def bbox(self):
+        """Return instance bounding boxes.
+
+        Shape: [N, 4] in (xmin, ymin, xmax, ymax) format.
+        """
+        assert len(self.instance_list) != 0
+        instance_bbox_list = []
+        for instance in self.instance_list:
+            instance_bbox_list.append(instance.bounds)
+        instance_bbox_array = np.array(instance_bbox_list)
+        instance_bbox_tensor = to_tensor(instance_bbox_array).to(dtype=torch.float32)
+        instance_bbox_tensor[:, 0] = torch.clamp(instance_bbox_tensor[:, 0], min=-self.max_x, max=self.max_x)
+        instance_bbox_tensor[:, 1] = torch.clamp(instance_bbox_tensor[:, 1], min=-self.max_y, max=self.max_y)
+        instance_bbox_tensor[:, 2] = torch.clamp(instance_bbox_tensor[:, 2], min=-self.max_x, max=self.max_x)
+        instance_bbox_tensor[:, 3] = torch.clamp(instance_bbox_tensor[:, 3], min=-self.max_y, max=self.max_y)
+        return instance_bbox_tensor
+
+    @property
     def fixed_num_sampled_points(self):
         if self.fixed_num is None or self.fixed_num <= 0:
             raise ValueError(
@@ -105,6 +123,161 @@ class LiDARInstanceLines(object):
             instance_points_tensor[:, :, 1], min=-self.max_y, max=self.max_y
         )
         return instance_points_tensor
+
+    @property
+    def shift_fixed_num_sampled_points(self):
+        """Return shifted versions of each polyline.
+
+        Shape: [N, num_shifts, fixed_num, 2].
+        For non-closed polylines, we use forward + reverse and pad.
+        For closed polylines, we roll over all points.
+
+        This is kept for compatibility with MapTR configs (v0).
+        """
+        fixed_num_sampled_points = self.fixed_num_sampled_points
+        instances_list = []
+        for fixed_num_pts in fixed_num_sampled_points:
+            is_poly = bool(fixed_num_pts[0].equal(fixed_num_pts[-1]))
+            fixed_num = int(fixed_num_pts.shape[0])
+            shift_pts_list = []
+            if is_poly:
+                for shift_right_i in range(fixed_num):
+                    shift_pts_list.append(fixed_num_pts.roll(shift_right_i, 0))
+            else:
+                shift_pts_list.append(fixed_num_pts)
+                shift_pts_list.append(fixed_num_pts.flip(0))
+            shift_pts = torch.stack(shift_pts_list, dim=0)
+
+            shift_pts[:, :, 0] = torch.clamp(shift_pts[:, :, 0], min=-self.max_x, max=self.max_x)
+            shift_pts[:, :, 1] = torch.clamp(shift_pts[:, :, 1], min=-self.max_y, max=self.max_y)
+
+            if not is_poly:
+                padding = torch.full(
+                    [fixed_num - shift_pts.shape[0], fixed_num, 2],
+                    self.padding_value,
+                    dtype=shift_pts.dtype,
+                    device=shift_pts.device,
+                )
+                shift_pts = torch.cat([shift_pts, padding], dim=0)
+            instances_list.append(shift_pts)
+
+        instances_tensor = torch.stack(instances_list, dim=0).to(dtype=torch.float32)
+        return instances_tensor
+
+    @property
+    def shift_fixed_num_sampled_points_v1(self):
+        """MapTR v1 shift protocol.
+
+        Shape: [N, num_shifts, fixed_num, 2] with shift_num = fixed_num - 1.
+        """
+        fixed_num_sampled_points = self.fixed_num_sampled_points
+        instances_list = []
+        for fixed_num_pts in fixed_num_sampled_points:
+            is_poly = bool(fixed_num_pts[0].equal(fixed_num_pts[-1]))
+            pts_num = int(fixed_num_pts.shape[0])
+            shift_num = pts_num - 1
+            if is_poly:
+                pts_to_shift = fixed_num_pts[:-1, :]
+            shift_pts_list = []
+            if is_poly:
+                for shift_right_i in range(shift_num):
+                    shift_pts_list.append(pts_to_shift.roll(shift_right_i, 0))
+            else:
+                shift_pts_list.append(fixed_num_pts)
+                shift_pts_list.append(fixed_num_pts.flip(0))
+            shift_pts = torch.stack(shift_pts_list, dim=0)
+
+            if is_poly:
+                _, _, num_coords = shift_pts.shape
+                tmp_shift_pts = shift_pts.new_zeros((shift_num, pts_num, num_coords))
+                tmp_shift_pts[:, :-1, :] = shift_pts
+                tmp_shift_pts[:, -1, :] = shift_pts[:, 0, :]
+                shift_pts = tmp_shift_pts
+
+            shift_pts[:, :, 0] = torch.clamp(shift_pts[:, :, 0], min=-self.max_x, max=self.max_x)
+            shift_pts[:, :, 1] = torch.clamp(shift_pts[:, :, 1], min=-self.max_y, max=self.max_y)
+
+            if not is_poly:
+                padding = torch.full(
+                    [shift_num - shift_pts.shape[0], pts_num, 2],
+                    self.padding_value,
+                    dtype=shift_pts.dtype,
+                    device=shift_pts.device,
+                )
+                shift_pts = torch.cat([shift_pts, padding], dim=0)
+            instances_list.append(shift_pts)
+
+        instances_tensor = torch.stack(instances_list, dim=0).to(dtype=torch.float32)
+        return instances_tensor
+
+    @property
+    def shift_fixed_num_sampled_points_v2(self):
+        """MapTR v2 shift protocol.
+
+        Shape: [N, fixed_num-1, fixed_num, 2].
+        For closed polylines, generate shifts from original vertices.
+        For open polylines, use forward + reverse and pad.
+        """
+        assert len(self.instance_list) != 0
+        instances_list = []
+        for instance in self.instance_list:
+            distances = np.linspace(0, instance.length, self.fixed_num)
+            poly_pts = np.array(list(instance.coords))
+            start_pts = poly_pts[0]
+            end_pts = poly_pts[-1]
+            is_poly = np.equal(start_pts, end_pts).all()
+
+            shift_pts_list = []
+            pts_num, _coords_num = poly_pts.shape
+            shift_num = pts_num - 1
+            final_shift_num = self.fixed_num - 1
+
+            if is_poly:
+                pts_to_shift = poly_pts[:-1, :]
+                for shift_right_i in range(shift_num):
+                    shift_pts = np.roll(pts_to_shift, shift_right_i, axis=0)
+                    pts_to_concat = np.expand_dims(shift_pts[0], axis=0)
+                    shift_pts = np.concatenate((shift_pts, pts_to_concat), axis=0)
+                    shift_instance = LineString(shift_pts)
+                    shift_sampled_points = (
+                        np.array([list(shift_instance.interpolate(distance).coords) for distance in distances])
+                        .reshape(-1, 2)
+                    )
+                    shift_pts_list.append(shift_sampled_points)
+            else:
+                sampled_points = (
+                    np.array([list(instance.interpolate(distance).coords) for distance in distances])
+                    .reshape(-1, 2)
+                )
+                flip_sampled_points = np.flip(sampled_points, axis=0)
+                shift_pts_list.append(sampled_points)
+                shift_pts_list.append(flip_sampled_points)
+
+            multi_shifts_pts = np.stack(shift_pts_list, axis=0)
+            shifts_num, _, _ = multi_shifts_pts.shape
+
+            # If polygon provides too many shifts, randomly subsample.
+            if shifts_num > final_shift_num:
+                index = np.random.choice(multi_shifts_pts.shape[0], final_shift_num, replace=False)
+                multi_shifts_pts = multi_shifts_pts[index]
+
+            multi_shifts_pts_tensor = to_tensor(multi_shifts_pts).to(dtype=torch.float32)
+            multi_shifts_pts_tensor[:, :, 0] = torch.clamp(multi_shifts_pts_tensor[:, :, 0], min=-self.max_x, max=self.max_x)
+            multi_shifts_pts_tensor[:, :, 1] = torch.clamp(multi_shifts_pts_tensor[:, :, 1], min=-self.max_y, max=self.max_y)
+
+            if multi_shifts_pts_tensor.shape[0] < final_shift_num:
+                padding = torch.full(
+                    [final_shift_num - multi_shifts_pts_tensor.shape[0], self.fixed_num, 2],
+                    self.padding_value,
+                    dtype=multi_shifts_pts_tensor.dtype,
+                    device=multi_shifts_pts_tensor.device,
+                )
+                multi_shifts_pts_tensor = torch.cat([multi_shifts_pts_tensor, padding], dim=0)
+
+            instances_list.append(multi_shifts_pts_tensor)
+
+        instances_tensor = torch.stack(instances_list, dim=0).to(dtype=torch.float32)
+        return instances_tensor
 
 
 class VectorizedLocalMap(object):
