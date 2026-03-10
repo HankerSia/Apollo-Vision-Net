@@ -9,7 +9,7 @@ _base_ = [
 
 # Smoke-test only: keep runtime short.
 # Override the schedule's default runner (usually 20 epochs).
-runner = dict(type='EpochBasedRunner', max_epochs=2)
+runner = dict(type='EpochBasedRunner', max_epochs=100)
 
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'

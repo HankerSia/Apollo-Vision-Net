@@ -1,0 +1,130 @@
+absl-py==2.3.1
+addict==2.4.0
+apptools @ file:///home/conda/feedstock_root/build_artifacts/apptools_1610582543268/work
+asttokens==3.0.1
+backcall==0.2.0
+black==24.8.0
+cachetools==5.5.2
+certifi==2025.11.12
+charset-normalizer==3.4.4
+click==8.1.8
+conda-pack @ file:///croot/conda-pack_1710258022278/work
+configobj @ file:///home/conda/feedstock_root/build_artifacts/configobj_1727014248968/work
+contourpy==1.1.1
+cycler==0.12.1
+decorator==5.2.1
+descartes==1.1.0
+envisage @ file:///home/conda/feedstock_root/build_artifacts/envisage_1623953337124/work
+exceptiongroup==1.3.1
+executing==2.2.1
+filelock==3.16.1
+fire==0.7.1
+flake8==7.1.2
+fonttools==4.57.0
+fsspec==2025.3.0
+fvcore==0.1.5.post20221221
+GeometricKernelAttention==1.0
+grpcio==1.70.0
+hf-xet==1.2.0
+huggingface-hub==0.36.0
+idna==3.11
+imageio==2.35.1
+importlib_metadata @ file:///home/conda/feedstock_root/build_artifacts/importlib-metadata_1726082825846/work
+importlib_resources @ file:///home/conda/feedstock_root/build_artifacts/importlib_resources_1725921340658/work
+iniconfig==2.1.0
+iopath==0.1.10
+ipython==8.12.3
+jedi==0.19.2
+joblib==1.4.2
+kiwisolver==1.4.7
+lazy_loader==0.4
+lightning-utilities==0.11.9
+llvmlite==0.31.0
+loguru @ file:///home/conda/feedstock_root/build_artifacts/loguru_1695547325717/work
+lyft-dataset-sdk==0.0.8
+Markdown==3.7
+MarkupSafe==2.1.5
+matplotlib==3.5.3
+matplotlib-inline==0.1.7
+mayavi @ file:///home/conda/feedstock_root/build_artifacts/mayavi_1666106352846/work
+mccabe==0.7.0
+mmcv-full==1.4.0
+mmdet==2.14.0
+-e git+https://github.com/hustvl/MapTR.git@0ecbf397b7c44a55d3c3dc10c13f248e819df95c#egg=mmdet3d&subdirectory=mmdetection3d
+mmsegmentation==0.14.1
+mypy_extensions==1.1.0
+narwhals==1.42.1
+networkx==2.8.8
+numba==0.48.0
+numpy==1.21.0
+nuscenes-devkit==1.1.11
+opencv-python==4.12.0.88
+packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1745345660/work
+pandas==2.0.3
+parso==0.8.5
+pathspec==0.12.1
+pexpect==4.9.0
+pickleshare==0.7.5
+pillow==10.4.0
+platformdirs==4.3.6
+plotly==6.5.0
+pluggy==1.5.0
+ply @ file:///home/conda/feedstock_root/build_artifacts/ply_1712242996588/work
+plyfile==1.1.3
+portalocker==3.0.0
+prettytable==3.11.0
+prompt_toolkit==3.0.52
+protobuf==5.29.5
+ptyprocess==0.7.0
+pure_eval==0.2.3
+pycocotools==2.0.7
+pycodestyle==2.12.1
+pyface @ file:///home/conda/feedstock_root/build_artifacts/pyface_1720292768523/work
+pyflakes==3.2.0
+Pygments @ file:///home/conda/feedstock_root/build_artifacts/pygments_1714846767233/work
+pyparsing==3.1.4
+PyQt5==5.15.9
+PyQt5-sip==12.12.2
+pyquaternion==0.9.9
+pytest==8.3.5
+python-dateutil==2.9.0.post0
+pytz==2025.2
+PyWavelets==1.4.1
+PyYAML==6.0.3
+requests==2.32.4
+safetensors==0.5.3
+scikit-image==0.21.0
+scikit-learn==1.3.2
+scipy==1.10.1
+Shapely==1.8.5.post1
+sip @ file:///home/conda/feedstock_root/build_artifacts/sip_1697300436403/work
+six @ file:///home/conda/feedstock_root/build_artifacts/six_1620240208055/work
+stack-data==0.6.3
+tabulate==0.9.0
+tensorboard==2.20.0
+tensorboard-data-server==0.7.2
+termcolor==2.4.0
+terminaltables==3.1.10
+threadpoolctl==3.5.0
+tifffile==2023.7.10
+timm==1.0.22
+toml @ file:///home/conda/feedstock_root/build_artifacts/toml_1604308577558/work
+tomli @ file:///home/conda/feedstock_root/build_artifacts/tomli_1727974628237/work
+torch==1.10.0+cu113
+torchaudio==0.10.0+rocm4.1
+torchmetrics==1.5.2
+torchvision==0.11.0+cu113
+tqdm==4.67.1
+traitlets==5.14.3
+traits @ file:///home/conda/feedstock_root/build_artifacts/traits_1696876176374/work
+traitsui @ file:///home/conda/feedstock_root/build_artifacts/traitsui_1684774008390/work
+trimesh==2.35.39
+typing_extensions==4.13.2
+tzdata==2025.3
+urllib3==2.2.3
+vtk==9.1.0
+wcwidth==0.2.14
+Werkzeug==3.0.6
+yacs==0.1.8
+yapf==0.31.0
+zipp==3.20.2

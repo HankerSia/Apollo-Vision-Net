@@ -125,6 +125,8 @@ class MapTRLossHead(nn.Module):
         self.sampler = build_sampler(sampler or dict(type='PseudoSampler'), context=self)
 
     def _get_gt_shifts_pts(self, gt_vecs) -> torch.Tensor:
+        if isinstance(gt_vecs, torch.Tensor):
+            return self._get_gt_shifts_pts_from_tensor(gt_vecs)
         if self.gt_shift_pts_pattern == 'v0':
             return gt_vecs.shift_fixed_num_sampled_points
         if self.gt_shift_pts_pattern == 'v1':
@@ -137,6 +139,84 @@ class MapTRLossHead(nn.Module):
             return gt_vecs.shift_fixed_num_sampled_points_v4
         raise NotImplementedError
 
+    def _tensorize_gt_vecs(self, gt_vecs: torch.Tensor) -> torch.Tensor:
+        """Normalize tensor-form GT vectors to shape [N, P, 2]."""
+        if gt_vecs.ndim == 3 and gt_vecs.size(-1) == 2:
+            return gt_vecs.to(dtype=torch.float32)
+        if gt_vecs.ndim == 2 and gt_vecs.size(-1) % 2 == 0:
+            return gt_vecs.view(gt_vecs.size(0), -1, 2).to(dtype=torch.float32)
+        if gt_vecs.numel() == 0:
+            return gt_vecs.new_zeros((0, self.num_pts_per_gt_vec, 2), dtype=torch.float32)
+        raise ValueError(f'Unsupported tensor GT vecs shape: {tuple(gt_vecs.shape)}')
+
+    def _get_gt_bbox_from_tensor(self, gt_vecs: torch.Tensor) -> torch.Tensor:
+        gt_pts = self._tensorize_gt_vecs(gt_vecs)
+        if gt_pts.size(0) == 0:
+            return gt_pts.new_zeros((0, 4))
+        xmin = gt_pts[..., 0].min(dim=1)[0]
+        ymin = gt_pts[..., 1].min(dim=1)[0]
+        xmax = gt_pts[..., 0].max(dim=1)[0]
+        ymax = gt_pts[..., 1].max(dim=1)[0]
+        return torch.stack([xmin, ymin, xmax, ymax], dim=-1)
+
+    def _get_gt_shifts_pts_from_tensor(self, gt_vecs: torch.Tensor) -> torch.Tensor:
+        """Approximate MapTR shift protocol from sampled point tensors.
+
+        Supports tensor GT of shape [N, P, 2] or flattened [N, 2P].
+        """
+        gt_pts = self._tensorize_gt_vecs(gt_vecs)
+        if gt_pts.size(0) == 0:
+            shift_num = max(int(self.num_pts_per_gt_vec) - 1, 0)
+            return gt_pts.new_zeros((0, shift_num, self.num_pts_per_gt_vec, 2))
+
+        all_instances = []
+        final_shift_num = max(int(self.num_pts_per_gt_vec) - 1, 0)
+        padding_value = float(-10000)
+
+        for pts in gt_pts:
+            fixed_num = int(pts.size(0))
+            if fixed_num == 0:
+                all_instances.append(gt_pts.new_full((final_shift_num, self.num_pts_per_gt_vec, 2), padding_value))
+                continue
+
+            is_poly = bool(torch.allclose(pts[0], pts[-1])) if fixed_num > 1 else False
+            shift_pts_list = []
+            if is_poly and fixed_num > 1:
+                pts_to_shift = pts[:-1, :]
+                shift_num = int(pts_to_shift.size(0))
+                for shift_right_i in range(shift_num):
+                    rolled = torch.roll(pts_to_shift, shifts=shift_right_i, dims=0)
+                    rolled = torch.cat([rolled, rolled[0:1]], dim=0)
+                    shift_pts_list.append(rolled)
+            else:
+                shift_pts_list.append(pts)
+                shift_pts_list.append(torch.flip(pts, dims=[0]))
+
+            shift_pts = torch.stack(shift_pts_list, dim=0).to(dtype=torch.float32)
+
+            if shift_pts.size(0) > final_shift_num:
+                shift_pts = shift_pts[:final_shift_num]
+            elif shift_pts.size(0) < final_shift_num:
+                padding = shift_pts.new_full(
+                    (final_shift_num - shift_pts.size(0), shift_pts.size(1), 2),
+                    padding_value,
+                )
+                shift_pts = torch.cat([shift_pts, padding], dim=0)
+
+            if shift_pts.size(1) != self.num_pts_per_gt_vec:
+                # Align point count conservatively by trim/pad.
+                if shift_pts.size(1) > self.num_pts_per_gt_vec:
+                    shift_pts = shift_pts[:, : self.num_pts_per_gt_vec, :]
+                else:
+                    point_pad = shift_pts.new_full(
+                        (shift_pts.size(0), self.num_pts_per_gt_vec - shift_pts.size(1), 2),
+                        padding_value,
+                    )
+                    shift_pts = torch.cat([shift_pts, point_pad], dim=1)
+            all_instances.append(shift_pts)
+
+        return torch.stack(all_instances, dim=0)
+
     def _get_target_single(
         self,
         cls_score: torch.Tensor,
@@ -147,6 +227,7 @@ class MapTRLossHead(nn.Module):
         gt_shifts_pts: torch.Tensor,
         gt_bboxes_ignore=None,
     ):
+        gt_labels = gt_labels.to(dtype=torch.long)
         num_bboxes = bbox_pred.size(0)
         gt_c = gt_bboxes.shape[-1]
 
@@ -373,12 +454,17 @@ class MapTRLossHead(nn.Module):
         all_bbox_preds = preds_dicts['all_bbox_preds'].float()
         all_pts_preds = preds_dicts['all_pts_preds'].float()
 
+        gt_labels_list = [gt.to(dtype=torch.long) for gt in gt_labels_list]
+
         num_dec_layers = len(all_cls_scores)
         device = gt_labels_list[0].device
 
         gt_vecs_list = copy.deepcopy(gt_vecs_list)
 
-        gt_bboxes_list = [gt.bbox.to(device) for gt in gt_vecs_list]
+        gt_bboxes_list = [
+            (gt.bbox.to(device) if hasattr(gt, 'bbox') else self._get_gt_bbox_from_tensor(gt).to(device))
+            for gt in gt_vecs_list
+        ]
         gt_shifts_pts_list = [self._get_gt_shifts_pts(gt).to(device) for gt in gt_vecs_list]
 
         all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)]

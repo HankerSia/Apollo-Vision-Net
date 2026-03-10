@@ -1,0 +1,42 @@
+ARG BASE_IMAGE=nvidia/cuda:11.3.1-cudnn8-runtime-ubuntu20.04
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-lc"]
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Basic runtime deps commonly needed by OpenCV/visualization and python packages.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bzip2 \
+        ca-certificates \
+        bash \
+        git \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Unpack the exact host environment created by conda-pack.
+# conda-pack archives are self-contained (include python + conda-unpack), so we
+# don't need to install Miniconda inside the image.
+ENV APOLLO_VNET_DIR=/opt/apollo_vnet
+COPY docker/apollo_vnet.tar.gz /tmp/apollo_vnet.tar.gz
+RUN mkdir -p "${APOLLO_VNET_DIR}" \
+    && tar -xzf /tmp/apollo_vnet.tar.gz -C "${APOLLO_VNET_DIR}" \
+    && rm -f /tmp/apollo_vnet.tar.gz \
+    && "${APOLLO_VNET_DIR}/bin/python" "${APOLLO_VNET_DIR}/bin/conda-unpack"
+
+ENV PATH=${APOLLO_VNET_DIR}/bin:${PATH}
+
+RUN mkdir -p /workspace/Apollo-Vision-Net
+WORKDIR /workspace/Apollo-Vision-Net
+
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+
+CMD ["bash"]

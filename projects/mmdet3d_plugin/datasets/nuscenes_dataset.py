@@ -79,6 +79,21 @@ class CustomNuScenesDataset(NuScenesDataset):
         self.metadata = data['metadata']
         self.version = self.metadata['version']
         return data_infos
+
+    def get_ann_info(self, index):
+        """Get annotation info with stable integer label dtype.
+
+        Upstream nuScenes dataset builds `gt_labels_3d` via `np.array(list)`
+        without an explicit dtype. When a sample ends up with zero valid boxes,
+        NumPy defaults that empty array to `float64`, which later becomes a
+        `DoubleTensor` in the pipeline. Full nuScenes is much more likely than
+        mini to include such edge-case samples after filtering.
+        """
+        ann_info = super().get_ann_info(index)
+        if 'gt_labels_3d' in ann_info:
+            ann_info['gt_labels_3d'] = np.asarray(
+                ann_info['gt_labels_3d'], dtype=np.int64)
+        return ann_info
         
     def prepare_train_data(self, index):
         """

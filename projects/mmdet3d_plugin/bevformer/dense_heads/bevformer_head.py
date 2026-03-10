@@ -266,6 +266,8 @@ class BEVFormerHead(DETRHead):
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
 
+        gt_labels = gt_labels.to(dtype=torch.long)
+
         # label targets
         labels = gt_bboxes.new_full((num_bboxes,),
                                     self.num_classes,
@@ -279,7 +281,12 @@ class BEVFormerHead(DETRHead):
         bbox_weights[pos_inds] = 1.0
 
         # DETR
-        bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
+        # When there is no positive match, some samplers normalize empty
+        # `pos_gt_bboxes` to shape [0, 4]. Direct assignment would then fail
+        # for 3D boxes whose target width is 7/9. Skip the write entirely for
+        # the empty case; `bbox_targets` is already zero-initialized.
+        if pos_inds.numel() > 0:
+            bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
         return (labels, label_weights, bbox_targets, bbox_weights,
                 pos_inds, neg_inds)
 
@@ -395,10 +402,26 @@ class BEVFormerHead(DETRHead):
         isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
         bbox_weights = bbox_weights * self.code_weights
 
-        loss_bbox = self.loss_bbox(
-            bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan,
-                                                               :10], bbox_weights[isnotnan, :10],
-            avg_factor=num_total_pos)
+        # Detection GT may be empty for some images/batches, and some box
+        # sources may provide fewer regression dims (e.g. without velocity).
+        # Upstream `L1Loss` asserts on empty tensors and exact shape equality,
+        # so only compute bbox regression when we have valid targets and align
+        # both sides to the common regression width.
+        reg_dim = min(
+            int(bbox_preds.size(-1)),
+            int(normalized_bbox_targets.size(-1)),
+            int(bbox_weights.size(-1)),
+            10,
+        )
+        valid_reg = bool(isnotnan.any().item()) and reg_dim > 0
+        if valid_reg:
+            loss_bbox = self.loss_bbox(
+                bbox_preds[isnotnan, :reg_dim],
+                normalized_bbox_targets[isnotnan, :reg_dim],
+                bbox_weights[isnotnan, :reg_dim],
+                avg_factor=num_total_pos)
+        else:
+            loss_bbox = bbox_preds.sum() * 0
         if digit_version(TORCH_VERSION) >= digit_version('1.8'):
             loss_cls = torch.nan_to_num(loss_cls)
             loss_bbox = torch.nan_to_num(loss_bbox)
@@ -449,6 +472,9 @@ class BEVFormerHead(DETRHead):
 
         num_dec_layers = len(all_cls_scores)
         device = gt_labels_list[0].device
+
+        gt_labels_list = [gt_labels.to(device=device, dtype=torch.long)
+                          for gt_labels in gt_labels_list]
 
         gt_bboxes_list = [torch.cat(
             (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
