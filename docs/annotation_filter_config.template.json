@@ -1,0 +1,83 @@
+{
+  "project": {
+    "name": "apollo_annotation_filter",
+    "version": "1.0.0",
+    "description": "Raw driving log filtering for annotation-ready scenes"
+  },
+  "scene": {
+    "duration_sec": 20,
+    "stride_sec": 10,
+    "keyframe_hz": 2
+  },
+  "quality_gate": {
+    "sensor_integrity": {
+      "camera_missing_rate_max": 0.05,
+      "lidar_drop_rate_max": 0.05,
+      "radar_drop_rate_max": 0.1,
+      "localization_failure_sec_max": 2.0
+    },
+    "time_sync": {
+      "camera_lidar_offset_ms_max": 50,
+      "radar_master_offset_ms_max": 100,
+      "continuous_anomaly_count_max": 3
+    },
+    "calibration": {
+      "reprojection_error_px_max": 3.0,
+      "ground_normal_jitter_deg_max": 5.0
+    },
+    "image_quality": {
+      "blur_score_min": 100.0,
+      "over_exposure_ratio_max": 0.25,
+      "under_exposure_ratio_max": 0.35,
+      "occlusion_score_max": 0.6
+    },
+    "pointcloud_quality": {
+      "valid_points_min": 30000,
+      "noise_ratio_max": 0.15
+    }
+  },
+  "scoring": {
+    "weights": {
+      "quality": 0.3,
+      "object": 0.2,
+      "interaction": 0.2,
+      "rare": 0.15,
+      "diversity": 0.15
+    },
+    "minimums": {
+      "avg_objects_per_frame": 3,
+      "dynamic_objects_per_scene": 1
+    },
+    "bonus": {
+      "night_scene": 0.05,
+      "rain_scene": 0.05,
+      "construction_zone": 0.05,
+      "rare_object_scene": 0.08
+    }
+  },
+  "sampling": {
+    "quotas": {
+      "day": 0.5,
+      "night": 0.2,
+      "rain": 0.1,
+      "intersection": 0.2
+    },
+    "deduplication": {
+      "enabled": true,
+      "similarity_threshold": 0.95,
+      "keep": "highest_score"
+    }
+  },
+  "review": {
+    "a_level_sample_ratio": 0.1,
+    "b_level_sample_ratio": 0.2,
+    "c_level_sample_ratio": 0.3,
+    "reject_on_manual_fail": true
+  },
+  "outputs": {
+    "export_keyframes": true,
+    "export_scene_table": true,
+    "export_reject_report": true,
+    "export_distribution_report": true
+  }
+}

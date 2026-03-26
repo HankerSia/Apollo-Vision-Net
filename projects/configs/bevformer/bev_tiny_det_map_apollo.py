@@ -284,7 +284,7 @@ data = dict(
     # For temporal BEVFormer, each dataset item already contains a queue of
     # frames stacked into `img` (see CustomNuScenesDataset.union2one). Keep
     # batch size 1 for minimal forward smoke tests.
-    samples_per_gpu=1,
+    samples_per_gpu=2,
     workers_per_gpu=4,
     # Required by projects/mmdet3d_plugin/bevformer/apis/mmdet_train.py
     shuffler_sampler=dict(type='DistributedGroupSampler'),
