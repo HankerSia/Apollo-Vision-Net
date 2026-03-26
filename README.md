@@ -8,7 +8,7 @@
 - [3.配置设计：如何在 cfg 中表达 det+map（以及如何映射到代码）](#section-3-config)
 - [4.实现改动：按模块拆解实际代码如何落地](#section-4-impl)
 - [5.评测协议与落盘产物：bbox 与 map 各自怎么评、产物在哪里](#section-5-eval)
-- [6.复现命令与测试结果（含 2026-02-09 离线复测）](#section-6-tests)
+- [6.复现命令与测试结果](#section-6-tests)
 - [7.常见坑与排障清单](#section-7-debug)
 - [8.后续迭代路线](#section-8-roadmap)
 - [9.工程化对账表与回归清单](#section-9-audit)
@@ -562,6 +562,25 @@ python tools/eval_map_offline.py \
 
 关键输出：
 - `NuscMap_iou/mAP = 0.0`
+
+### 6.3 目标检测、地图生成结果图像空间投影可视化
+#### 6.3.1 单独可视化
+<table>
+  <tr>
+    <td align="center">
+      目标检测：<br>
+      <img src="https://i-blog.csdnimg.cn/direct/20acc2bee468400bb1a0acd39fb4dbe2.png" width="420">
+    </td>
+    <td align="center">
+      地图生成：<br>
+      <img src="https://i-blog.csdnimg.cn/direct/3d79be4a65ef405db539159cf4a71cea.png" width="420">
+    </td>
+  </tr>
+</table>
+
+#### 6.3.2 目标检测、地图生成联合投影可视化
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/2d8d3944654e46b1806b90c963a05571.jpeg#pic_center)
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/e329f5ad5f4c4f1bae9709fb54283d52.jpeg#pic_center)
 
 <a id="section-7-debug"></a>
 ## 7.常见坑与排障清单
