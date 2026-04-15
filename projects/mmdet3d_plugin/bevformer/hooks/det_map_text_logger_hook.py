@@ -148,7 +148,12 @@ class DetMapTextLoggerHook(TextLoggerHook):
             if name in priority_misc:
                 continue
 
-            is_map = name.startswith("loss_map") or ".loss_map" in name
+            is_map = (
+                name.startswith("loss_map")
+                or ".loss_map" in name
+                or name.startswith("map_")
+                or ".map_" in name
+            )
             is_det = (
                 (name.startswith("loss_") and not name.startswith("loss_map"))
                 or (".loss_" in name and ".loss_map" not in name)

@@ -1140,8 +1140,8 @@ class BEVFormerDetMapHeadApollo(BEVFormerHead):
                     losses['loss_map_pts'] = map_loss_dict.get('loss_pts', loss_anchor)
                     losses['loss_map_dir'] = map_loss_dict.get('loss_dir', loss_anchor)
 
-                    # Aggregated map loss (bbox/iou are typically 0-weight in MapTR configs).
-                    losses['loss_map'] = (
+                    # Aggregated map loss for logging only.
+                    losses['map_main_total'] = (
                         losses['loss_map_cls']
                         + losses['loss_map_bbox']
                         + losses['loss_map_iou']
@@ -1158,18 +1158,18 @@ class BEVFormerDetMapHeadApollo(BEVFormerHead):
                     if getattr(self, 'debug_nan', False):
                         import traceback
                         traceback.print_exc()
-                    losses['loss_map'] = loss_anchor
+                    losses['map_main_total'] = loss_anchor
                     losses['loss_map_cls'] = loss_anchor
                     losses['loss_map_pts'] = loss_anchor
                     losses['loss_map_dir'] = loss_anchor
             else:
-                losses['loss_map'] = loss_anchor
+                losses['map_main_total'] = loss_anchor
                 losses['loss_map_cls'] = loss_anchor
                 losses['loss_map_pts'] = loss_anchor
                 losses['loss_map_dir'] = loss_anchor
         elif self.enable_map:
             # Fallback to legacy keys (kept to avoid breaking old experiments).
-            losses.setdefault('loss_map', loss_anchor)
+            losses.setdefault('map_main_total', loss_anchor)
             losses.setdefault('loss_map_cls', loss_anchor)
             losses.setdefault('loss_map_pts', loss_anchor)
 

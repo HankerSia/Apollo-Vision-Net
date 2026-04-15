@@ -1,5 +1,28 @@
 前言：本文围绕 **det（3D 检测）** 与 **map（MapTR 实时地图生成）** 两个感知任务并行模型设计，系统梳理 Apollo-Vision-Net 中 det+map 多任务模型的“设计 → 配置 → 源码实现 → 评测闭环 → 复现结果”。目标是让读者能够对照文档完成模型复现、测试，并明确每个 cfg 字段对应的源码位置、推理输出的接口规范与设计理由。
 
+## 近期修复说明
+
+- `[Modified]` `projects/mmdet3d_plugin/maptrv2/dense_heads/bevformer_det_map_head_apollo_v2.py`
+  - MapTRv2 decoder 改为默认严格模式：配置了 `map_decoder` 后，若 decoder 构建或执行失败，将直接报错，不再静默退回 fallback MLP head。
+  - 新增 decoder 合约校验：`map_num_query == num_map_vec * map_num_pts`、`cls/reg branches` 数量覆盖 `num_dec`、`dec_states/dec_references` 必须为 4 维，并明确提示 `return_intermediate=True` 缺失问题。
+  - fallback 仅允许白名单初始化类异常；非白名单异常一律抛出，避免实验配置与实际执行路径不一致。
+  - 修复 `loss_anchor` 兜底路径在 `one2many_preds is None` 时可能二次报错的问题。
+
+- `[Modified]` `projects/mmdet3d_plugin/bevformer/dense_heads/bevformer_det_map_head_apollo.py`
+  - 将 map 主分支聚合项从 `loss_map` 调整为仅用于日志展示的 `map_main_total`，避免与子项同时参与 `_parse_losses` 时发生重复累计。
+
+- `[Modified]` `projects/mmdet3d_plugin/maptrv2/dense_heads/bevformer_det_map_head_apollo_v2.py`
+  - 统一 map 损失记账方式：保留真正参与反传的 `loss_map_*` 项，将汇总项拆为日志字段，新增 `map_total` 用于观察地图分支总体趋势。
+
+- `[Modified]` `projects/mmdet3d_plugin/bevformer/hooks/det_map_text_logger_hook.py`
+  - logger 兼容新的 `map_*` 汇总字段，保证 `map_main_total`、`map_total`、`map_o2m_*` 仍按 map 分类输出。
+
+- 当前建议读取的 map 日志字段
+  - `map_total`：地图分支综合损失
+  - `map_main_total`：one-to-one 主分支损失和
+  - `loss_map_o2m`：one-to-many 分支损失和
+  - `loss_map_seg` / `loss_map_pv_seg`：辅助分割损失
+
 ## 目录
 
 - [0.复现准备（环境、数据、权重）](#section-0-prereq)

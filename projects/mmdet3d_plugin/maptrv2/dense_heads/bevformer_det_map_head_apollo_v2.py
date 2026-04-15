@@ -35,6 +35,12 @@ class BEVFormerDetMapHeadApolloV2(BEVFormerDetMapHeadApollo):
         map_aux_seg: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> None:
+        transformer_cfg = kwargs.get('transformer', None)
+        self.map_decoder_requested = bool(
+            isinstance(transformer_cfg, dict) and (transformer_cfg.get('map_decoder', None) is not None)
+        )
+        self.map_decoder_fallback_on_error = bool(kwargs.pop('map_decoder_fallback_on_error', False))
+
         self.map_num_vec_one2one = int(map_num_vec_one2one)
         self.map_num_vec_one2many = int(map_num_vec_one2many)
         self.map_k_one2many = int(map_k_one2many)
@@ -46,8 +52,16 @@ class BEVFormerDetMapHeadApolloV2(BEVFormerDetMapHeadApollo):
 
         super().__init__(*args, **kwargs)
 
+        if self.map_decoder_requested and (self.map_decoder is None):
+            raise RuntimeError(
+                'map_decoder is configured for BEVFormerDetMapHeadApolloV2 but was not built successfully. '
+                'Refusing to continue because silent fallback would make the experiment configuration diverge '
+                'from the actual model path.'
+            )
+
         self.num_map_vec = int(total_num_map_vec)
         self.map_num_query = int(self.num_map_vec * self.map_num_pts)
+        self._validate_map_decoder_setup()
 
         self.map_aux_seg_use = bool(self.map_aux_seg.get('use_aux_seg', False))
         self.map_aux_seg_bev = bool(self.map_aux_seg.get('bev_seg', False))
@@ -83,6 +97,85 @@ class BEVFormerDetMapHeadApolloV2(BEVFormerDetMapHeadApollo):
                 self.map_pv_seg_loss = nn.BCEWithLogitsLoss(
                     pos_weight=torch.tensor([self.map_aux_pv_pos_weight], dtype=torch.float32)
                 )
+
+    def _map_decoder_num_layers(self) -> int:
+        return int(getattr(self.map_decoder, 'num_layers', 0) or self.map_decoder_num_layers or 1)
+
+    def _validate_map_decoder_setup(self) -> None:
+        expected_num_query = int(self.num_map_vec * self.map_num_pts)
+        if int(self.map_num_query) != expected_num_query:
+            raise RuntimeError(
+                f'map_num_query mismatch: expected {expected_num_query} from '
+                f'num_map_vec({self.num_map_vec}) * map_num_pts({self.map_num_pts}), '
+                f'but got {self.map_num_query}.'
+            )
+
+        if self.map_query_embed is not None and int(self.map_query_embed.num_embeddings) != int(self.num_map_vec):
+            raise RuntimeError(
+                f'map_query_embed.num_embeddings={self.map_query_embed.num_embeddings} does not match '
+                f'num_map_vec={self.num_map_vec}.'
+            )
+        if self.map_instance_embedding is not None and int(self.map_instance_embedding.num_embeddings) != int(self.num_map_vec):
+            raise RuntimeError(
+                f'map_instance_embedding.num_embeddings={self.map_instance_embedding.num_embeddings} does not match '
+                f'num_map_vec={self.num_map_vec}.'
+            )
+        if self.map_pts_embedding is not None and int(self.map_pts_embedding.num_embeddings) != int(self.map_num_pts):
+            raise RuntimeError(
+                f'map_pts_embedding.num_embeddings={self.map_pts_embedding.num_embeddings} does not match '
+                f'map_num_pts={self.map_num_pts}.'
+            )
+        if self.map_point_query_embedding is not None and int(self.map_point_query_embedding.num_embeddings) != int(self.map_num_query):
+            raise RuntimeError(
+                f'map_point_query_embedding.num_embeddings={self.map_point_query_embedding.num_embeddings} does not match '
+                f'map_num_query={self.map_num_query}.'
+            )
+
+        if self.map_decoder is None:
+            return
+
+        num_dec = self._map_decoder_num_layers()
+        if self.map_cls_branches is None or self.map_reg_branches is None:
+            raise RuntimeError(
+                'MapTRv2 decoder is configured but map cls/reg branches are not initialized.'
+            )
+        if len(self.map_cls_branches) < num_dec:
+            raise RuntimeError(
+                f'map_cls_branches length {len(self.map_cls_branches)} is smaller than decoder layers {num_dec}.'
+            )
+        if len(self.map_reg_branches) < num_dec:
+            raise RuntimeError(
+                f'map_reg_branches length {len(self.map_reg_branches)} is smaller than decoder layers {num_dec}.'
+            )
+
+    def _is_whitelisted_map_decoder_exception(self, exc: Exception) -> bool:
+        msg = str(exc)
+        whitelist_prefixes = (
+            'map point-query embeddings are not initialized',
+            'map_num_query mismatch:',
+        )
+        return isinstance(exc, RuntimeError) and msg.startswith(whitelist_prefixes)
+
+    def _handle_map_decoder_failure(self, stage: str, exc: Exception) -> None:
+        if self.map_decoder_fallback_on_error and self._is_whitelisted_map_decoder_exception(exc):
+            if not hasattr(self, '_maptrv2_decoder_fail_printed'):
+                self._maptrv2_decoder_fail_printed = 0
+            if self._maptrv2_decoder_fail_printed < 3:
+                print(f'[det_map_v2][map_decoder][{stage}] failed, falling back:', repr(exc))
+                self._maptrv2_decoder_fail_printed += 1
+            return
+
+        if self.map_decoder_fallback_on_error:
+            raise RuntimeError(
+                f'MapTRv2 decoder execution failed at stage={stage!r} with a non-whitelisted exception. '
+                'Fallback is enabled, but only allowed for explicitly whitelisted setup errors.'
+            ) from exc
+
+        raise RuntimeError(
+            f'MapTRv2 decoder execution failed at stage={stage!r}. '
+            'Configured decoder fallback is disabled, so the run is stopped instead of silently '
+            'switching to the fallback MLP map head.'
+        ) from exc
 
     def _build_maptrv2_self_attn_mask(self, device: torch.device) -> Optional[torch.Tensor]:
         if self.map_num_vec_one2many <= 0:
@@ -391,12 +484,13 @@ class BEVFormerDetMapHeadApolloV2(BEVFormerDetMapHeadApollo):
             rank, _ = get_dist_info()
             if rank == 0:
                 logging.getLogger('mmdet').info(
-                    '[det_map_v2][run_cfg] one2one=%d one2many=%d k=%d lambda=%.3f decoder=%s',
+                    '[det_map_v2][run_cfg] one2one=%d one2many=%d k=%d lambda=%.3f decoder=%s fallback_on_error=%s',
                     self.map_num_vec_one2one,
                     self.map_num_vec_one2many,
                     self.map_k_one2many,
                     self.map_lambda_one2many,
                     type(self.map_decoder).__name__ if self.map_decoder is not None else None,
+                    self.map_decoder_fallback_on_error,
                 )
             self._run_cfg_logged_v2 += 1
 
@@ -414,8 +508,9 @@ class BEVFormerDetMapHeadApolloV2(BEVFormerDetMapHeadApollo):
             and (self.map_cls_branches is not None)
             and (self.map_reg_branches is not None)
         ):
+            self._validate_map_decoder_setup()
             try:
-                num_dec = int(getattr(self.map_decoder, 'num_layers', 0) or self.map_decoder_num_layers or 1)
+                num_dec = self._map_decoder_num_layers()
                 if (
                     self.map_query_embed_type == 'instance_pts'
                     and (self.map_instance_embedding is not None)
@@ -456,6 +551,17 @@ class BEVFormerDetMapHeadApolloV2(BEVFormerDetMapHeadApollo):
                     num_pts_per_vec=self.map_num_pts,
                 )
 
+                if (not isinstance(dec_states, torch.Tensor)) or (dec_states.dim() != 4):
+                    raise RuntimeError(
+                        'MapTRv2 decoder must return 4D dec_states with shape '
+                        '[num_dec, num_query, bs, C]. Check map_decoder.return_intermediate=True.'
+                    )
+                if (not isinstance(dec_references, torch.Tensor)) or (dec_references.dim() != 4):
+                    raise RuntimeError(
+                        'MapTRv2 decoder must return 4D dec_references with shape '
+                        '[num_dec, bs, num_query, 2]. Check map_decoder.return_intermediate=True.'
+                    )
+
                 all_cls = []
                 all_pts01 = []
                 all_bbox01 = []
@@ -485,14 +591,15 @@ class BEVFormerDetMapHeadApolloV2(BEVFormerDetMapHeadApollo):
                 outs['one2many_outs'] = one2many_preds
                 ran_decoder = True
             except Exception as e:
-                if not hasattr(self, '_maptrv2_decoder_fail_printed'):
-                    self._maptrv2_decoder_fail_printed = 0
-                if self._maptrv2_decoder_fail_printed < 3:
-                    print('[det_map_v2][map_decoder] failed, falling back:', repr(e))
-                    self._maptrv2_decoder_fail_printed += 1
+                self._handle_map_decoder_failure('point_queries', e)
                 ran_decoder = False
 
         if not ran_decoder:
+            if self.map_decoder_requested and (not self.map_decoder_fallback_on_error):
+                raise RuntimeError(
+                    'MapTRv2 decoder was configured but did not produce outputs, and fallback is disabled. '
+                    'Stopping to keep the executed model aligned with the experiment config.'
+                )
             q = self.map_query_embed.weight.unsqueeze(0).expand(bs, -1, -1)
             q = q + bev_global.unsqueeze(1)
             cls_last = self.map_cls_head(q)
@@ -579,7 +686,18 @@ class BEVFormerDetMapHeadApolloV2(BEVFormerDetMapHeadApollo):
             gt_map_vecs_pts_loc = [gt_map_vecs_pts_loc]
 
         rep_labels, rep_vecs = self._repeat_gt_for_one2many(gt_map_vecs_label, gt_map_vecs_pts_loc)
-        loss_anchor = next(iter(losses.values())) if len(losses) > 0 else one2many_preds['all_cls_scores'].sum() * 0.0
+        if len(losses) > 0:
+            loss_anchor = next(iter(losses.values()))
+        elif isinstance(one2many_preds, dict) and isinstance(one2many_preds.get('all_cls_scores', None), torch.Tensor):
+            loss_anchor = one2many_preds['all_cls_scores'].sum() * 0.0
+        elif isinstance(outs.get('map_preds_dicts', None), dict) and isinstance(outs['map_preds_dicts'].get('all_cls_scores', None), torch.Tensor):
+            loss_anchor = outs['map_preds_dicts']['all_cls_scores'].sum() * 0.0
+        elif isinstance(outs.get('map_cls_logits', None), torch.Tensor):
+            loss_anchor = outs['map_cls_logits'].sum() * 0.0
+        elif isinstance(outs.get('bev_embed', None), torch.Tensor):
+            loss_anchor = outs['bev_embed'].sum() * 0.0
+        else:
+            loss_anchor = torch.zeros((), device='cpu')
 
         if isinstance(one2many_preds, dict):
             try:
@@ -589,25 +707,26 @@ class BEVFormerDetMapHeadApolloV2(BEVFormerDetMapHeadApollo):
                     preds_dicts=one2many_preds,
                     gt_bboxes_ignore=None,
                 )
-                losses['loss_map_o2m_cls'] = self.map_lambda_one2many * one2many_loss.get('loss_cls', loss_anchor)
-                losses['loss_map_o2m_bbox'] = self.map_lambda_one2many * one2many_loss.get('loss_bbox', loss_anchor)
-                losses['loss_map_o2m_iou'] = self.map_lambda_one2many * one2many_loss.get('loss_iou', loss_anchor)
-                losses['loss_map_o2m_pts'] = self.map_lambda_one2many * one2many_loss.get('loss_pts', loss_anchor)
-                losses['loss_map_o2m_dir'] = self.map_lambda_one2many * one2many_loss.get('loss_dir', loss_anchor)
+                losses['map_o2m_cls'] = self.map_lambda_one2many * one2many_loss.get('loss_cls', loss_anchor)
+                losses['map_o2m_bbox'] = self.map_lambda_one2many * one2many_loss.get('loss_bbox', loss_anchor)
+                losses['map_o2m_iou'] = self.map_lambda_one2many * one2many_loss.get('loss_iou', loss_anchor)
+                losses['map_o2m_pts'] = self.map_lambda_one2many * one2many_loss.get('loss_pts', loss_anchor)
+                losses['map_o2m_dir'] = self.map_lambda_one2many * one2many_loss.get('loss_dir', loss_anchor)
                 losses['loss_map_o2m'] = (
-                    losses['loss_map_o2m_cls']
-                    + losses['loss_map_o2m_bbox']
-                    + losses['loss_map_o2m_iou']
-                    + losses['loss_map_o2m_pts']
-                    + losses['loss_map_o2m_dir']
+                    losses['map_o2m_cls']
+                    + losses['map_o2m_bbox']
+                    + losses['map_o2m_iou']
+                    + losses['map_o2m_pts']
+                    + losses['map_o2m_dir']
                 )
-                if 'loss_map' in losses:
-                    losses['loss_map'] = losses['loss_map'] + losses['loss_map_o2m']
-                else:
-                    losses['loss_map'] = losses['loss_map_o2m']
             except Exception as e:
                 print('[det_map_v2][one2many] map loss failed:', repr(e))
                 losses['loss_map_o2m'] = loss_anchor * 0.0
+                losses['map_o2m_cls'] = loss_anchor * 0.0
+                losses['map_o2m_bbox'] = loss_anchor * 0.0
+                losses['map_o2m_iou'] = loss_anchor * 0.0
+                losses['map_o2m_pts'] = loss_anchor * 0.0
+                losses['map_o2m_dir'] = loss_anchor * 0.0
 
         if self.map_aux_seg_use and self.map_aux_seg_bev and self.map_seg_loss is not None:
             pred_seg = outs.get('map_seg', None)
@@ -620,10 +739,6 @@ class BEVFormerDetMapHeadApolloV2(BEVFormerDetMapHeadApollo):
                     loss_map_seg = self.map_seg_loss(pred_seg.float(), seg_targets.float())
                     loss_map_seg = loss_map_seg * self.map_aux_seg_loss_weight
                     losses['loss_map_seg'] = loss_map_seg
-                    if 'loss_map' in losses:
-                        losses['loss_map'] = losses['loss_map'] + loss_map_seg
-                    else:
-                        losses['loss_map'] = loss_map_seg
 
         if self.map_aux_seg_use and self.map_aux_seg_pv and self.map_pv_seg_loss is not None:
             pred_pv_seg = outs.get('map_pv_seg', None)
@@ -636,9 +751,11 @@ class BEVFormerDetMapHeadApolloV2(BEVFormerDetMapHeadApollo):
                     loss_map_pv_seg = self.map_pv_seg_loss(pred_pv_seg.float(), pv_targets.float())
                     loss_map_pv_seg = loss_map_pv_seg * self.map_aux_pv_loss_weight
                     losses['loss_map_pv_seg'] = loss_map_pv_seg
-                    if 'loss_map' in losses:
-                        losses['loss_map'] = losses['loss_map'] + loss_map_pv_seg
-                    else:
-                        losses['loss_map'] = loss_map_pv_seg
+
+        map_total = losses.get('map_main_total', loss_anchor * 0.0)
+        map_total = map_total + losses.get('loss_map_o2m', loss_anchor * 0.0)
+        map_total = map_total + losses.get('loss_map_seg', loss_anchor * 0.0)
+        map_total = map_total + losses.get('loss_map_pv_seg', loss_anchor * 0.0)
+        losses['map_total'] = map_total
 
         return losses
