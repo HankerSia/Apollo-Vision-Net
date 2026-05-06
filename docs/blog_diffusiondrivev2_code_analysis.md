@@ -1,350 +1,591 @@
-# DiffusionDriveV2 代码级实现解析（更偏工程落地）：强化学习（RL, Reinforcement Learning）+ Truncated Diffusion 如何把“多模态”做成“可用的多模态”
+# SparseDriveV2 技术解析：因子化词表如何把静态打分路线推到新上限
 
-> 面向读者：想把论文读成“能跑的工程”，并且希望知道每个关键公式/模块在代码里具体落到哪。
+> 面向读者：希望把论文读成可落地的工程方案，并进一步理解 SparseDriveV2 的核心设计为什么有效、实现上应如何理解，以及它与静态词表和动态生成两类路线到底差在哪里。
 >
 > 参考：
-> - DiffusionDriveV2 论文（arXiv）：https://arxiv.org/html/2512.07745v1
-> - 官方代码仓库：https://github.com/hustvl/DiffusionDriveV2
-> - 训练/评估说明：https://github.com/hustvl/DiffusionDriveV2/blob/master/docs/train_eval.md
-> - 对比论文（DIVER / arXiv:2507.04049）：https://arxiv.org/abs/2507.04049
+> - 论文（arXiv）：https://arxiv.org/html/2603.29163v1
+> - 官方代码仓库：https://github.com/swc-17/SparseDriveV2
+> - 仓库说明里的训练与评估文档：https://github.com/swc-17/SparseDriveV2/blob/main/docs/train_eval.md
+> - 论文中展示的结构图与结果图：仓库 `assets/` 目录中的示意图
 >
-> 备注：本文聚焦 **DiffusionDriveV2** 的代码实现路径（不是 DiffusionDrive V1）。文中涉及的“anchor / truncated diffusion / GRPO / PDM（PDMS）”等术语，尽量以论文与代码为准。
+> 备注：本文聚焦 SparseDriveV2 的方法逻辑与工程实现思路，尽量按“问题定义 → 方法设计 → 工程落点 → 实验结论”的顺序展开，而不是逐行复述公式。
 
 ---
 
-## 1. 先把结论讲清楚：DiffusionDriveV2 在解决什么核心问题？
+## 0. 导读：为什么 SparseDriveV2 值得认真看
 
-在工程落地中，挑战并不在于“生成多条轨迹”，而在于：
+在最近一波端到端自动驾驶规划工作里，SparseDriveV2 最值得关注的地方，不在于它提出了一套更复杂的生成范式，而在于它沿着一条看似更朴素的 scoring-based 路线，做出了足够有说服力的领先结果。
 
-1) **多模态不等于有效多样性**：如果训练目标仍是单 GT（Ground Truth，标注专家轨迹）的 imitation learning（IL, Imitation Learning，模仿学习），多模态输出往往向 GT 附近集中（mode collapse），或产生大量不可行样本（碰撞/越界/不舒适）。
-2) **评价指标不对齐**：纯 open-loop 的 L2/L1，只鼓励贴近单条 GT，无法对“多意图覆盖”和“闭环可执行性”给出直接监督。
+如果先只看结果，它的重要性已经非常明确：
 
-DiffusionDriveV2 的策略可以概括为一句话：
+1. 在 **NAVSIM v1** 上，SparseDriveV2 以 **92.0 PDMS** 超过了同为 ResNet-34 backbone 的 DriveSuprim、DiffusionDriveV2 和 ipad。
+2. 在 **NAVSIM v2** 上，它给出了 **90.1 EPDMS**，说明这套方法在更严格的评测环境下依然成立。
+3. 在 **Bench2Drive** 上，它进一步拿到 **89.15 Driving Score** 和 **70.00 Success Rate**，把 open-loop 的提升延续到了闭环场景。
 
-> **保留“anchor + truncated diffusion”的多模态生成框架，同时把 diffusion 采样过程当成 stochastic policy，用 GRPO（Group Relative Policy Optimization，一类组相对策略优化）风格的 RL 把质量下界抬起来，并通过探索噪声机制在采样空间中显式引入多样性。**
+换句话说，它超越的是此前一批很有代表性的 SOTA 路线，包括 **DriveSuprim、Hydra-MDP++、DiffusionDriveV2、ipad**，以及同阶段的 **GoalFlow、ARTEMIS、FUMP、DIVER** 等方法。
 
-对应到代码层面对外表现就是：
+更关键的是，它并不是靠更重的生成器、更多的采样步数，或者更复杂的训练技巧取得领先；它的核心优势恰恰来自一条很多人以为已经接近天花板的路线：**先把可选轨迹覆盖得更细，再把评分过程做得更轻。** 具体来说，就是让候选空间更密、但不把所有候选都逐个重算，而是先粗筛、再精排。
 
-- 推理仍然快（truncated diffusion，常见两步 DDIM：Denoising Diffusion Implicit Models，一类用于加速扩散采样的隐式去噪采样器）。
-- 训练不再仅依赖 IL：会计算奖励（PDM/PDMS 等闭环 proxy；PDM = Planning Decision Metric，PDMS = PDM Score），并用 logprob（log-probability，对数概率）进行 policy gradient（策略梯度）更新。
-- 为了避免跨意图的直接比较导致模式坍缩，采用 **intra-anchor** 的组内相对优势；同时用 **truncated / hard constraint** 在跨意图层面施加底线安全约束。
+这也是 SparseDriveV2 最值得认真读的原因：它不是在既有框架上做小修小补，而是在重新定义 scoring-based planning 的上限。
 
----
+如果把论文的贡献压缩成最关键的三点，其实就是：
 
-## 2. 读代码不迷路：论文主线 → 代码导航图
-
-把论文的“输入 → 生成 → 评估 → 更新”流程，映射成 5 个你在仓库里能直接搜到的落点：
-
-1) **感知/特征抽取（Transfuser backbone）**
-- 位置：`navsim/agents/diffusiondrivev2/diffusiondrivev2_model_rl.py`
-- 关键类：`V2TransfuserModel` + `TransfuserBackbone`
-
-2) **多模态轨迹生成（anchor-conditioned truncated diffusion）**
-- 位置：同文件里的 `TrajectoryHead`
-- 关键资产：`plan_anchor` / `plan_anchor_path`
-  - 常见 shape：`(20, 8, 2)`（20 个意图簇，每条 8 个 waypoint，xy 坐标）
-
-3) **探索噪声 + logprob**
-- 位置：自定义 `DDIMScheduler_with_logprob.step()`（在 `diffusiondrivev2_model_rl.py`/`diffusiondrivev2_model_sel.py` 中出现）
-- 作用：把“采样一步”变成可计算 $\log \pi_\theta$ 的 stochastic transition，为 RL 链路提供梯度通道。
-
-4) **RL：intra-anchor GRPO / truncated GRPO（优势函数与截断逻辑）**
-- 位置：`TrajectoryHead.forward_train_rl()` / `TrajectoryHead.get_rlloss()`
-
-5) **Mode selector（coarse-to-fine 两阶段选择器）**
-- 位置：`navsim/agents/diffusiondrivev2/diffusiondrivev2_model_sel.py`
-- 直观理解：生成器负责生成候选，selector 负责最终决策。生成器输出越稳定，selector 的决策负担就越小。
+1. 它先用一组 scaling study 证明，scoring-based planning 的瓶颈主要来自词表密度和计算预算，而不是范式本身。
+2. 它提出了 path / velocity 的因子化词表，把候选空间从“有限轨迹集合”扩展成“可组合的超密轨迹空间”。
+3. 它设计了 coarse-to-fine 的可扩展打分策略，让超密候选集在训练和推理时都仍然可算。
 
 ---
 
-## 2.1 论文 Figure 2（Overall architecture）在代码里怎么对应？
+## 1. 核心判断：SparseDriveV2 到底在解决什么问题
 
-Figure 2 本质上画的是一条“**感知 → 多模态生成 → 质量优化（RL）→ 决策选择（selector）**”的链路；如果你把它当作代码导读图，建议按下面 4 个模块理解：
+SparseDriveV2 面对的是端到端自动驾驶里一个非常现实的问题：**多模态规划并不缺候选，真正稀缺的是既覆盖得足够密、又能评分得足够快、同时还保留足够高质量的候选集合。**
 
-1) **Condition encoder（条件编码 / 场景表征）**
-   - 输入：多传感器与状态特征（camera/lidar/history/status 等）。
-   - 输出：BEV（Bird’s-Eye View，俯视栅格）等中间表征，供后续规划头做 cross-attention。
-   - 代码对应：`V2TransfuserModel` / `TransfuserBackbone`（`diffusiondrivev2_model_rl.py`）。
+论文开头的 scaling study 其实已经把问题说透了：当静态 trajectory vocabulary 继续变密时，性能会持续上升，而且在计算瓶颈出现之前并没有明显饱和。这说明一个非常重要的判断：
 
-2) **Anchor-conditioned trajectory diffusion（基于 anchor 的截断扩散生成器）**
-   - 输入：场景表征 + `plan_anchor`（意图先验）。
-   - 输出：每个 anchor 下的一组轨迹候选（多模态 proposals）。
-   - 关键点：Figure 2 的 “truncated diffusion” 对应到实现里通常是**非常少的采样步数**（例如两步 DDIM），用来把推理时延压到规划可用的量级。
-   - 代码对应：`TrajectoryHead` + `DDIMScheduler_with_logprob.step()`。
+> 以前很多 scoring-based planner 不是“静态词表不行”，而是“词表还不够密，且打分方式还不够省”。
 
-3) **RL on diffusion as policy（把扩散采样当 stochastic policy 做 RL）**
-   - Figure 2 里最容易忽略的一点：RL 优化的不是“轨迹点本身”，而是**扩散采样链路的概率模型**。
-   - 实现上会把每一步采样产生的 $\log \pi_\theta$
-     （对数概率）记录下来，然后用 GRPO（Group Relative Policy Optimization）风格优势函数做 policy gradient（策略梯度）。
-   - 代码对应：`forward_train_rl()` / `get_rlloss()` + scheduler 里返回 `log_prob` 的改造。
+基于这个判断，SparseDriveV2 给出的答案不是“把模型继续做复杂”，而是把下面两件事同时做到位：
 
-4) **Mode selector（候选打分与最终决策）**
-   - Figure 2 的右侧通常对应 “scoring / selection”：在多条候选中选出最终执行轨迹。
-   - 实现上会把候选轨迹 token 当成 query，与 BEV/agent token 做 cross-attention，然后输出每条候选的 score。
-   - 代码对应：`diffusiondrivev2_model_sel.py` 中的 scorer decoder（例如 `ScorerTransformerDecoder`），并结合 BCE（Binary Cross-Entropy，二元交叉熵）/ranking loss 做训练。
+1. **把轨迹词表做成因子化结构**：把 trajectory 分解为 geometric path 和 velocity profile，两者组合出超密候选集。
+2. **把打分做成分层过滤**：先对 path 和 velocity 做粗粒度评分，再对少量组合候选做细粒度评分。
 
-如果你用一句话去“翻译” Figure 2：**DiffusionDriveV2 用 anchor 把多模态拆成若干意图簇；用 truncated diffusion 低成本生成每簇候选；用 GRPO 式 RL 抬高每簇候选的质量下界；最后用 selector 在全局语境下做最终选择。**
-
-## 2.2 论文 Figure 5（Qualitative comparison）在说明什么？
-
-Figure 5 给了一个非常直观的“效果侧证”：在 NAVSIM navtest split 的转弯（turning）场景里，对比 **Vanilla Diffusion / DiffusionDrive / DiffusionDriveV2** 的轨迹可视化，可以把三者差异理解成从“能生成”到“能用”的三个阶段。
-
-1) **Vanilla Diffusion：多样性有，但可执行性弱**
-   - 在转弯场景里更容易出现轨迹几何形状不合理（例如转弯半径不连续、轨迹飘到不可行驶区域），本质原因是：它主要在做分布拟合，缺少面向驾驶可执行性的显式约束。
-
-2) **DiffusionDrive（V1 思路）：更贴近驾驶先验，但仍容易“围着单 GT 收敛”**
-   - 引入 anchor / intention prior 后，轨迹的宏观形态会更像“可驾驶”的一组模式；但如果训练信号仍以单 GT（Ground Truth，标注专家轨迹）的模仿为主，很容易看到候选在关键决策点附近趋同（多模态“看起来多”，但有效差异不足）。
-
-3) **DiffusionDriveV2：候选轨迹更干净、转弯更稳定，且模式之间更分离**
-   - Figure 5 里更常见的现象是：转弯轨迹的曲率变化更平滑、越界/碰撞类硬失败更少；同时不同候选之间不会全部挤在同一条路径附近。
-   - 这和代码侧的两处改造对应得很紧：
-     - **truncated diffusion + DDIM**：用很少的采样步数把推理时延压下去，保证在线规划可用；训练阶段再用更合适的优化信号补偿质量。
-     - **RL（Reinforcement Learning，强化学习）+ GRPO（Group Relative Policy Optimization）+ selector**：用 reward/truncation 把“硬失败”压下去，用组内优势保持多模态结构，最后由 selector 在全局语境里挑出最优执行轨迹。
-
-如果你在读代码时想把 Figure 5 变成“检查清单”，可以关注三类可视化特征：**（1）转弯曲率是否连续；（2）是否越界/碰撞；（3）候选之间是否存在可用的意图差异，而不是在同一路径附近做细微抖动。**
-
-## 3. 工程启动路径：训练/评估入口在哪里？
-
-DiffusionDriveV2 基于 NAVSIM（NVIDIA Autonomous Vehicle Simulation，自动驾驶仿真/评测工具链）devkit + Hydra（Python 配置管理框架）配置启动。你如果想复现，建议按下面的层次去理解：
-
-### 3.1 缓存（强烈建议先做）
-
-- `navsim/planning/script/run_dataset_caching.py`
-- `navsim/planning/script/run_metric_caching.py`
-
-缓存的意义：将特征/指标预计算，从而避免训练过程中每个 step 都进行高开销的 I/O（Input/Output，数据读写）与仿真计算。
-
-### 3.2 两阶段训练入口
-
-- RL 训练：`navsim/planning/script/run_training.py agent=diffusiondrivev2_rl_agent ...`
-- selector 训练：`navsim/planning/script/run_training.py agent=diffusiondrivev2_sel_agent ...`
-
-### 3.3 快速评估
-
-- `navsim/planning/script/run_pdm_score_fast.py agent=diffusiondrivev2_sel_agent ...`
-
-完整命令参考官方文档：`docs/train_eval.md`。
+所以它的核心，并不是再发明一个更复杂的生成器，而是把 scoring-based planning 推到新的密度上限：**先用更轻的结构覆盖更大的动作空间，再用更高效的筛选把这些候选真正转化成分数优势。**
 
 ---
 
-## 4. Agent 层到底在干啥：`Diffusiondrivev2_Rl_Agent` 的“工程职责”
+## 2. 方法总览：从“单一轨迹”到“路径 + 速度”的组合空间
 
-文件：`navsim/agents/diffusiondrivev2/diffusiondrivev2_rl_agent.py`
+SparseDriveV2 的标题已经把它的立场写得很明确：`Scoring is All You Need`。它并不是要否定动态生成路线，而是想证明另一件事：**只要静态词表足够密、打分足够高效，纯 scoring 路线依然可以做到很强。**
 
-这层基本不承载算法创新，主要负责“将模型接入 NAVSIM 训练体系”的工程封装（glue code）：
+![SparseDriveV2 overall architecture](https://raw.githubusercontent.com/swc-17/SparseDriveV2/main/assets/overview.png)
 
-- 初始化时构建 `TransfuserModel`（实际是 `V2TransfuserModel`）。
-- RL 阶段通常 **冻结 backbone**，仅训练 `_trajectory_head`（提升优化稳定性，也更接近“仅微调规划头”的设定）。
-- `forward()` 传入 `eta=1.0`：训练期更随机、更利于 exploration（也更符合“policy”语义）。
-- `compute_loss()` 只负责把模型返回的 loss/reward/subreward 组织成日志。
+> 图 1：SparseDriveV2 的整体框架。核心思路是先把轨迹拆成 path 和 velocity，再分别做粗粒度打分，最后只对少量组合候选做精排。
 
-一句话：**Agent 负责训练循环对接；核心逻辑都在 model / trajectory head。**
+整篇论文的主线可以概括成四步：
 
----
+1. **问题重述**：自动驾驶规划最终是从候选轨迹里选一个最优解。
+2. **瓶颈识别**：单一 monolithic trajectory vocabulary 很快会遇到计算和内存上限。
+3. **结构重写**：把轨迹拆成 path 和 velocity 两个因子。
+4. **高效打分**：先粗筛，再精排，避免在全量组合上做重计算。
 
-## 5. Truncated diffusion 生成器：`TrajectoryHead` 里的关键结构
-
-文件：`navsim/agents/diffusiondrivev2/diffusiondrivev2_model_rl.py`
-
-### 5.1 `V2TransfuserModel.forward()` 的骨架
-
-典型结构是：
-
-1) 读取 `features`（camera/lidar/status）。
-2) backbone 得到 BEV（Bird’s-Eye View，俯视栅格）表征。
-3) transformer decoder 做 cross-attention（query：轨迹/agent；kv：BEV/status）。
-4) `self._trajectory_head(...)` 生成轨迹候选及（训练时）RL 相关统计量。
-
-### 5.2 `plan_anchor`：多模态的“语义坐标系”
-
-在 `TrajectoryHead.__init__()` 通常能看到：
-
-- `plan_anchor = np.load(plan_anchor_path)`
-- `self.plan_anchor = nn.Parameter(torch.tensor(plan_anchor), requires_grad=False)`
-
-工程含义：
-
-- 你可以把每个 anchor 理解成一个 coarse intention（左转/右转/直行/变道/让行…）。
-- diffusion 并不是从“纯随机”出发，而是围绕 anchor 子空间做 denoise，这样更可控、更稳定。
-
----
-
-## 6. 关键创新 ①：乘性探索噪声 + 可用的 logprob
-
-如果只从工程角度看，`DDIMScheduler_with_logprob.step()` 做了两件决定 RL 能不能跑起来的关键事：
-
-### 6.1 让采样步骤可微：返回 `log_prob`
-
-原版 diffusers 的 `DDIMScheduler.step()` 更偏“推理工具”，不会把每步的概率项显式输出。
-
-但 RL 需要 $\log \pi_\theta$，所以这里改成返回：
-
-- `prev_sample`
-- `prev_sample_mean`
-- `log_prob`
-
-### 6.2 探索噪声更接近“策略扰动”，而非“逐点抖动”
-
-论文强调：轨迹 gaussian additive noise 会破坏几何结构。
-
-代码里通常实现成“乘性为主 + 少量加性”的形式：
-
-$$x_{t-1} = \mu_{t} \odot \epsilon_{mul} + \sigma_{t} \cdot \epsilon_{add}$$
-
-直觉：
-
-- 乘性噪声更接近整体尺度/偏置的变化，使生成轨迹更平滑，更符合驾驶风格的连续变化。
-- 代码里一般还会给 std 下限（例如 `min=0.04` 一类的 clamp），避免探索熵塌缩。
-
----
-
-## 7. 关键创新 ②：Intra-anchor GRPO（组内相对优势，避免跨意图坍缩）
-
-DiffusionDriveV2 的一个关键工程策略是：
-
-> **不同 anchor 表征不同意图，advantage normalization 更适合在同一意图簇内进行，避免跨意图直接混合归一化。**
-
-实现上通常是把 reward reshape 成：
-
-- `reward_group`: `(B, G, K)`
-  - `K`：anchor 数（常见 20）
-  - `G`：每个 anchor 内采样的变体数（组内多样性）
-
-然后只在 `G` 维度做归一化，得到组内优势：
+如果把一条轨迹记作
 
 $$
-A_{k,i} = \frac{r_{k,i} - \mathrm{mean}(r_{k,1..G})}{\mathrm{std}(r_{k,1..G}) + \epsilon}
+\tau = \{(x_t, y_t)\}_{t=1}^{T},
 $$
 
-这相当于：在同一意图簇内进行相对比较与学习，而不同意图之间避免进行强行的全局排序。
-
-代码层面常见还会叠一个 per-step discount（降低早期高噪声 step 的梯度权重）。
-
----
-
-## 8. 关键创新 ③：Inter-anchor truncated GRPO（跨意图共享硬约束）
-
-只做 intra-anchor 的风险是：某个意图组内的“最优”可能仍然很差。
-
-DiffusionDriveV2 的折中是：
-
-- 跨意图 **不做谁更优的 rank**（避免 mode collapse）。
-- 但是跨意图 **共享绝对失败的约束**（例如 collision/越界）。
-
-实现上通常会看到对优势做截断：
-
-- 负优势置零（不惩罚“比均值差一点”的样本，减少坍缩压力）。
-- 硬失败（例如碰撞）直接给强惩罚。
-
-抽象成公式就是类似：
+SparseDriveV2 的关键，不是直接对这个序列建一个巨大的词表，而是把它分解成：
 
 $$
-A^{\text{trunc}} = \begin{cases}
--1, & \text{collision (hard fail)}\\
-\max(0, A), & \text{otherwise}
-\end{cases}
+\tau \leftrightarrow (p, v),
 $$
 
+其中：
+
+1. $p$ 表示 geometric path，描述“往哪里走”。
+2. $v$ 表示 velocity profile，描述“怎么快慢地走”。
+
+这个拆法的价值在于，它把一个难以直接枚举的 spatiotemporal 空间，转成了两个更容易离散化、也更容易组合的子空间。
+
+从论文视角看，这里其实还隐含着一个更强的判断：**轨迹空间的稠密覆盖，不一定要靠更复杂的生成过程，也可以靠更合理的结构化表示来获得。** SparseDriveV2 的核心创新，本质上就是把这一判断做成了可训练、可评估、可部署的工程方案。
+
 ---
 
-## 9. RL loss：优势是怎么落到 diffusion 链路 logprob 上的？
+## 3. 仓库阅读路径：代码应该从哪里开始看
 
-这里可以理解为 PPO（Proximal Policy Optimization，近端策略优化）/GRPO 的简化实现：
+从官方仓库 README 的结构看，SparseDriveV2 的工程分层比较清晰，主要可以从这几块进入：
 
-1) rollout 阶段（`forward_train_rl()`）：采样 diffusion chain，记录每一步 logprob 与生成轨迹。
-2) 更新阶段（`get_rlloss()`）：用当前参数重新计算 logprob，结合优势做 policy loss。
+1. `navsim/`：核心规划实现所在，承载模型、训练逻辑、评估接口和任务封装。
+2. `scripts/`：训练、数据缓存、评估、可视化等入口脚本。
+3. `docs/train_eval.md`：实际跑实验最关键的说明文档。
+4. `assets/`：论文里提到的结构图、实验图、可视化图。
+5. `download/`：下载 checkpoint 或相关资源的地方。
 
-DiffusionDriveV2 通常不引入显式 value network（GRPO 的一个工程优势是减少对 critic 的依赖），并会混入一个 IL loss 作为稳定项：
+如果你是第一次看这类仓库，建议优先按这个顺序理解：
+
+1. 先看 README，知道模型目标和结果上限。
+2. 再看 `docs/train_eval.md`，知道训练/评估流程。
+3. 然后再下钻 `navsim/`，把“候选构造”和“打分流程”对应到代码职责。
+
+如果用一句话概括它的代码阅读路径，那就是：**先看候选怎么构造，再看候选怎么被筛选。** 这和论文的组织方式是高度一致的。
+
+---
+
+## 4. 核心设计一：因子化词表到底解决了什么
+
+传统 scoring-based planner 的做法通常是：先构建一个固定 trajectory vocabulary，再对所有候选逐个打分。问题在于，词表一旦继续变密，计算和显存压力都会迅速膨胀。
+
+SparseDriveV2 的做法是把 trajectory factorize 成两个维度：
 
 $$
-L = L_{RL} + \lambda L_{IL}
+p = \{(x_i, y_i)\}_{i=1}^{S}, \qquad v = \{v_t\}_{t=1}^{T}
 $$
 
-当 batch 里正优势样本很少时，IL 权重会更大（避免训练崩）。
+这里：
+
+1. Path 只保留空间几何，不关心每个时刻到底多快。
+2. Velocity 只保留时间上的速度演化，不关心轨迹几何长什么样。
+
+这个设计的工程收益非常直接：
+
+1. path vocabulary 可以更专注于空间覆盖，比如直行、左转、右转、弯道贴线、换道等几何模式。
+2. velocity vocabulary 可以更专注于纵向控制，比如慢速跟车、稳定巡航、加速通过、低速转弯等速度模式。
+3. 两者组合后，候选轨迹数变成 $N_p \times N_v$，在词表结构不爆炸的情况下获得组合级的覆盖率。
+
+可以把它理解成一种“把驾驶意图拆成两个正交轴”的做法：**空间形状负责意图，速度曲线负责节奏。**
+
+从原论文的方法章节看，这里还有两层实现细节值得补上：
+
+1. **从 trajectory 到 path / velocity 的转换不是抽象概念，而是明确的重采样过程。**
+	path 是沿累计路程按固定空间间隔 $\Delta s$ 重新采样得到的几何路径；velocity 则是按固定时间间隔 $\Delta t$ 计算得到的速度序列。
+2. **从 path / velocity 回到 trajectory 也有明确的组合算子。**
+	论文先由速度序列累积得到行驶距离 $s_t$，再沿 path 在对应距离上插值，最终恢复时空轨迹。
+
+换句话说，SparseDriveV2 不是简单把一条轨迹“拆开存一下”，而是定义了一套可逆的表示方式：
+
+$$
+(p, v) = \mathcal{D}(\tau), \qquad \tau = \mathcal{C}(p, v)
+$$
+
+这使得 path vocabulary 和 velocity vocabulary 不只是两个辅助特征集合，而是真正可以组合出最终规划轨迹的基础表示。
+
+### 4.1 词表是怎么来的：不是手工规则，而是数据驱动构建
+
+论文在 `Scalable Vocabulary Construction` 里把这一点讲得很清楚：SparseDriveV2 的 path vocabulary 和 velocity vocabulary 都来自大规模人类驾驶数据，而不是手工写出来的规则模板。
+
+具体过程可以概括为：
+
+1. 从训练集未来轨迹中提取足够长的 driving demonstrations。
+2. 把这些轨迹先转换成 path 和 velocity 两种表示。
+3. 分别对 path 和 velocity 做 K-Means 聚类，得到代表性的 path anchors 和 velocity anchors。
+4. 最终通过全组合形成 trajectory vocabulary：
+
+$$
+\mathcal{T} = \{ \mathcal{C}(p_i, v_j) \mid p_i \in \mathcal{P}, v_j \in \mathcal{V} \}
+$$
+
+这一步非常关键，因为它解释了 SparseDriveV2 为什么能在不引入动态生成的前提下，把词表密度推到论文里强调的 **32x** 水平。对于 NAVSIM v1，论文给出的典型配置是：
+
+1. $N_p = 1024$ 条 path anchors。
+2. $N_v = 256$ 条 velocity anchors。
+3. 最终组合得到 $1024 \times 256 = 262{,}144$ 条 trajectory anchors。
+
+相较于很多 prior scoring-based 方法常用的 8192 条 monolithic trajectory anchors，这个组合空间的密度提升不是边际优化，而是量级上的变化。
 
 ---
 
-## 10. Mode selector：为什么它在实现上这么“重”？
+## 5. 核心设计二：为什么 path 和 velocity 要分开打分
 
-在端到端（E2E, End-to-End）planner 中，selector 并非可选模块，而是承担最终决策的关键组件。
+如果直接对所有组合轨迹做打分，模型当然会更“直接”，但代价也会迅速变得不可接受。SparseDriveV2 的关键，就是把这件昂贵的事情拆成两层：
 
-代码层面对应：
+### 5.1 第一层：粗粒度 factorized scoring
 
-- `ScorerTransformerDecoder` / `ScorerTransformerDecoderLayer`：把轨迹 token 当 query，与 BEV/agent 语义做 cross-attention。
-- coarse-to-fine：先粗排再精排。
-- 常见：BCE（Binary Cross-Entropy，二元交叉熵）分类 + ranking / margin loss 组合。
+先独立对 path 和 velocity 打分：
 
-工程层面的直观理解：
+$$
+s^p_i = f_p(E_p(p_i), F, E), \qquad s^v_j = f_v(E_v(v_j), F, E)
+$$
 
-- 生成器越可靠，selector 越偏向“选择最优候选”，而非“过滤大量低质量样本”。
-- 训练上分两阶段（先 RL 抬生成器下界，再训 selector）也是为了让学习目标更分离。
+这里：
 
----
+1. $F$ 是 scene feature。
+2. $E$ 是 status feature。
+3. $E_p$ 和 $E_v$ 是对 path / velocity 的编码器。
 
-## 11. 阅读代码最容易迷路的 5 个点（以及更省时间的追法）
+直观上，这一层在做两件事：
 
-1) `G / num_groups / ego_fut_mode(K)`：
-   - `K` 多数就是 anchor 数（常见 20）。
-   - `G` 是每个 anchor 内采样变体数。
-2) 为什么推理只做 2 步 diffusion：truncated diffusion，以推理速度换取采样开销（训练阶段通过 RL/selector 等机制补偿质量）。
-3) logprob 从哪来：靠 scheduler 改造 + 训练期 stochastic（`eta=1`）。
-4) PDM reward 是不是在线交互：不是，更多是 NAVSIM 的离线闭环 proxy/并行 scorer。
-5) 为什么经常出现 “GT vs proposals” 的 pairwise 计算：更省算力，也更明确“候选相对 GT 的好坏”。
+1. path scoring 过滤掉明显不适合当前场景的空间形状。
+2. velocity scoring 过滤掉明显不合理的速度模式。
 
----
+例如：
 
-## 12. DiffusionDriveV2 vs DIVER（arXiv:2507.04049）：同样是“RL + Diffusion”，差异在哪里？
+1. 在拥堵场景里，高速 velocity profile 往往不合理。
+2. 在直行道路上，强转弯 path 往往不合理。
 
-这部分我建议用“研究动机 → 机制设计 → 训练信号 → 评价指标”四个维度去对齐，因为它们其实在解决两个相邻但不完全相同的问题。
+它的价值在于，大量低质量组合会被提前排除在“真正组成轨迹之前”。
 
-### 12.1 共同点：都在对抗 IL 的单 GT 瓶颈
+### 5.2 第二层：fine-grained trajectory scoring
 
-DIVER 的论文开宗明义指出：多数端到端自动驾驶（E2E-AD, End-to-End Autonomous Driving）规划依赖单专家轨迹做监督，会导致保守、同质化、以及多模态的 mode collapse。
+在粗筛后，再对少量 composed trajectories 做精排。对应形式上就是：
 
-DiffusionDriveV2 也是在这个问题域里，但它更偏“让 DiffusionDrive 的多模态候选可用”。
+$$
+\tau_{i,j} = \mathcal{C}(p_i, v_j)
+$$
 
-### 12.2 核心机制对齐表
+然后对组合后的轨迹再进行一次 re-conditioning / interaction / scoring。
 
-| 维度 | DiffusionDriveV2 | DIVER (2507.04049) |
-|---|---|---|
-| 多模态来源 | anchor / intention prior + truncated diffusion（强调推理两步、高吞吐） | Policy-Aware Diffusion Generator（PADG）：条件包含 map+agents，显式生成多条轨迹并引入 **Reference GTs** |
-| “单 GT”怎么破 | 仍以 GT 为重要参考，但通过 RL + exploration 抬多模态质量下界 | 从单 GT 派生 **multiple reference trajectories**，并用 Hungarian matching 让每个 mode 对齐不同 reference，直接缓解“全围着 GT 收敛” |
-| RL 用来优化什么 | 在 diffusion 采样链上做 policy gradient：用优势约束碰撞/可行驶区域/效率等；intra-anchor 归一化避免跨意图坍缩 | 把 diffusion 当政策，用 GRPO 优化 **diversity reward + safety reward**，显式把“多样性”写进 reward（论文式定义 pairwise distance） |
-| 关键稳定性技巧 | intra-anchor advantage + inter-anchor truncated（只传播硬失败）+ IL 稳定项 | hybrid IL+RL：$L_{total}=\lambda_{match}L_{match}+\lambda_{RL}L_{RL}$；用 matching loss 强化模式分配 |
-| 评价指标取向 | NAVSIM/PDM/PDMS 等更偏闭环质量；多样性更多通过多模态候选/selector体现 | 明确指出 L2 不适合多模态，提出 **Diversity Metric**（归一化 pairwise dispersion，范围 [0,1]） |
+这一步的意义，不是重复前一步，而是补上一个在驾驶场景里非常关键的事实：**path 和 velocity 并不总是独立的。**
 
-### 12.3 DIVER 更“理论化/指标化”的点：Reference GT + Diversity Metric
+比如：
 
-从 DIVER 的论文表述来看，它有两个非常“强论文信号”的设计：
+1. 一个急转弯 path，通常不能配非常高的速度。
+2. 一个平直 path，通常可以容纳更高的速度上限。
 
-1) **Reference GTs + Hungarian matching loss**：
-   - 用多个 reference GT 引导不同 mode 对齐不同“驾驶风格/意图”。
-   - 训练目标不再把所有 mode 都拉向同一个 GT。
-2) **Diversity Metric**：
-   - 显式反对 L2 open-loop。
-   - 使用归一化的轨迹分散度作为衡量多样性的指标（并且设计成 [0,1] 可比）。
+所以粗粒度 scoring 负责“筛掉大多数不可能”，细粒度 scoring 负责“在剩下的候选里做最终排序和决策”。
 
-### 12.4 DiffusionDriveV2 更“工程化”的点：两步采样 + selector + 可落地的训练配方
+### 5.3 论文里还有一个关键点：scene encoder 并不依赖显式 BEV 构建
 
-DiffusionDriveV2 的优势更偏向工程实践总结：
+这一点在博客里也值得单独强调。论文的 `Scene Encoding` 采用了和 SparseDrive 一脉相承的思路：直接从多视角图像中提取 scene features，再结合 ego status 做交互，而不是先显式构建一个厚重的 BEV 表示再去做规划。
 
-- truncated diffusion：推理成本极低，适配在线规划延迟。
-- 把 RL 作用点放在“采样链路的可控改造”（logprob + 噪声设计 + 优势截断），避免训练不稳定。
-- selector 两阶段：把“生成”和“决策”解耦，利于工程迭代。
+这意味着 SparseDriveV2 的效率优势不只来自“词表结构更聪明”，也来自“前端表征没有把计算预算过早耗尽”。在方法上，它把大部分算力留给了真正影响规划质量的候选筛选和精排阶段。
 
-如果你要从工程实现角度选路线：
+### 5.4 Top-K 不是抽象概念，而是有明确的两级规模设置
 
-- 想要**快 + 工程可控**：DiffusionDriveV2 的“anchor + truncated diffusion + RL 抬下界 + selector”更直接。
-- 想要**把多样性定义/评价做得更严格**：DIVER 的 reference GT + diversity metric 更体系化。
+论文在实现细节里给出了非常具体的 progressive filtering 配置，这也是理解 SparseDriveV2 推理效率的关键：
+
+1. 第一层 decoder 先保留 top-128 的 path anchors 和 top-64 的 velocity anchors。
+2. 第二层再进一步收缩到 20 条 path 和 20 条 velocity。
+3. 最终只对 $20 \times 20 = 400$ 条 trajectory hypotheses 做 fine-grained scoring。
+
+这个数字很重要，因为它说明 SparseDriveV2 的推理优势不是“把 26 万条候选都算一遍”，而是先用很便宜的 coarse scoring 把大盘子收缩，再把真正昂贵的细粒度推理限制在 400 条候选上。对于 NAVSIM v2，论文还专门把第二层 velocity 数量从 20 缩到 10，以进一步降低 metric ground-truth 计算开销。
 
 ---
 
-## 13. 结尾总结：你应该带走的 3 个代码级要点
+## 6. 图 1 解读：整体架构在表达什么
 
-1) 多模态的“坐标系”在 `plan_anchor`，truncated diffusion 决定了推理成本。
-2) RL 能不能跑起来，关键是 `DDIMScheduler_with_logprob.step()` 这类工程改造：必须拿到 logprob，且探索噪声要“像驾驶”。
-3) 为缓解模式坍缩，优势设计需要尊重意图结构：intra-anchor 归一化 + inter-anchor 的硬失败共享，是一种兼顾稳定性与多样性的折中方案。
+如果把论文的整体框架图当成代码流程图，它基本就是下面这个顺序：
+
+1. **Scene encoding**：从多相机图像和 ego status 中抽取场景特征。
+2. **Factorized vocabulary**：构建 path vocabulary 和 velocity vocabulary。
+3. **Coarse scoring**：分别给 path 和 velocity 打分。
+4. **Top-K selection**：选出少量高质量 path/velocity。
+5. **Composition**：把它们组合成候选轨迹。
+6. **Fine-grained scoring**：对组合轨迹进行二次打分。
+7. **Final decision**：选出最终执行轨迹。
+
+这张图最容易被忽略的一点是：**SparseDriveV2 的难点不是“候选数量大”，而是“候选数量大却不需要逐个全量重算”。**
+
+它把最重的 spatiotemporal reasoning 放在了最后的少量候选上，而不是一开始就对全量组合做昂贵交互。
 
 ---
 
-（完）
+## 7. 训练目标：为什么它不是一个单纯的分类问题
+
+SparseDriveV2 的训练方式，本质上是一个分层监督系统。它的目标不是做单点回归，也不是只做一次分类，而是把多个阶段都对齐到最终规划质量上。
+
+论文里最重要的监督项可以概括为三类：
+
+### 7.1 Path-level supervision
+
+对 ground-truth path 和 path anchors 做距离监督，然后构造 soft target distribution，再用 cross-entropy 训练 path scorer。
+
+### 7.2 Velocity-level supervision
+
+对 ground-truth velocity profile 和 velocity anchors 做距离监督，再训练 velocity scorer。
+
+### 7.3 Trajectory-level supervision
+
+对于组合后的 trajectory anchors，再做 trajectory-level imitation learning / metric supervision。
+
+如果写成总目标，大致可以理解成：
+
+$$
+\mathcal{L} = \mathcal{L}_{path} + \mathcal{L}_{vel} + \mathcal{L}_{traj} + \alpha \mathcal{L}_{metric}
+$$
+
+其中：
+
+1. $\mathcal{L}_{path}$ 负责几何覆盖。
+2. $\mathcal{L}_{vel}$ 负责纵向节奏。
+3. $\mathcal{L}_{traj}$ 负责最终轨迹选择。
+4. $\mathcal{L}_{metric}$ 负责把闭环指标、规则约束或 teacher signal 引入训练。
+
+这类分层损失的好处很明确：**你不是只告诉模型“最终那条轨迹对”，而是在逐层告诉它“路径怎么选、速度怎么选，以及组合后怎么选”。**
+
+如果对照原文，这里还有两个细节值得补充：
+
+1. coarse path scoring 用的是 masked average squared distance 构造 soft target。
+2. velocity scoring 用的是 velocity profile 的 $L_1$ 距离构造 soft target。
+
+也就是说，SparseDriveV2 并不是把词表学习做成一个硬标签分类问题，而是把“离 GT 更近的 anchor 应该拿更高概率”这种结构化偏好显式写进了监督信号里。这样做的直接好处是，模型学到的不只是“哪一个是对的”，而是“哪些更接近正确答案”。
+
+---
+
+## 8. 工程视角：为什么它比“直接扩大静态词表”更聪明
+
+如果只是简单把 monolithic trajectory vocabulary 扩大，问题会很快暴露：
+
+1. 词表越大，显存压力越高。
+2. 逐候选打分越慢。
+3. 模型越容易在训练和推理时都变得笨重。
+
+SparseDriveV2 的 factorization 让词表密度显著提升，但并不需要按同样比例增加所有计算。
+
+可以把这个思路记成一句话：
+
+> **不是把每条轨迹都单独学一遍，而是先学“空间形状”和“速度节奏”两个基元，再组合。**
+
+这和语言模型里“词表变大”和“子词分解”的思路很像，只是这里换成了轨迹空间。
+
+更重要的是，因子化之后，模型更容易学习到跨场景共享的结构：
+
+1. 路径几何可以跨速度复用。
+2. 速度模式可以跨路径复用。
+3. 高质量候选不需要在同一个大表里重复编码。
+
+这也是 SparseDriveV2 能在不引入复杂生成器的前提下，依然把性能推高的根本原因。
+
+如果把它翻译成一句工程判断：**SparseDriveV2 的强，不在于某个单点模块特别“花哨”，而在于它把表示、筛选和监督这三件事放在同一套计算预算下协同优化了。**
+
+---
+
+## 9. 实验结果：为什么它的领先更有说服力
+
+SparseDriveV2 的结果之所以有说服力，不是因为它在某一个数据集上多涨了零点几分，而是因为它在 **NAVSIM v1、NAVSIM v2、Bench2Drive** 这几类代表性 benchmark 上，都给出了同一方向的结论：**scoring-based planning 仍然有明显的性能上限可以继续往上推。**
+
+下面用论文 Table 2 的完整 NAVSIM v1 结果来对照，这样可以更完整地看出 SparseDriveV2 和不同路线之间的差异：
+
+| Method | Img. Backbone | NC ↑ | DAC ↑ | TTC ↑ | Comf. ↑ | EP ↑ | PDMS ↑ |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| VADv2 [vadv2] | ResNet-34 | 97.2 | 89.1 | 91.6 | 100 | 76.0 | 80.9 |
+| UniAD [uniad] | ResNet-34 | 97.8 | 91.9 | 92.9 | 100 | 78.8 | 83.4 |
+| Transfuser [transfuser] | ResNet-34 | 97.7 | 92.8 | 92.8 | 100 | 79.2 | 84.0 |
+| PARA-Drive [paradrive] | ResNet-34 | 97.9 | 92.4 | 93.0 | 99.8 | 79.3 | 84.0 |
+| DRAMA [drama] | ResNet-34 | 98.0 | 93.1 | 94.8 | 100 | 80.1 | 85.5 |
+| GoalFlow [goalflow] | ResNet-34 | 98.3 | 93.8 | 94.3 | 100 | 79.8 | 85.7 |
+| Hydra-MDP [hydramdp] | ResNet-34 | 98.3 | 96.0 | 94.6 | 100 | 78.7 | 86.5 |
+| Hydra-MDP++ [hydramdp++] | ResNet-34 | 97.6 | 96.0 | 93.1 | 100 | 80.4 | 86.6 |
+| ARTEMIS [artemis] | ResNet-34 | 98.3 | 95.1 | 94.3 | 100 | 81.4 | 87.0 |
+| FUMP [fump] | ResNet-34 | 98.1 | 96.2 | 94.2 | 100 | 82.0 | 87.8 |
+| DiffusionDrive [diffusiondrive] | ResNet-34 | 98.2 | 96.2 | 94.7 | 100 | 82.2 | 88.1 |
+| WoTE [wote] | ResNet-34 | 98.5 | 96.8 | 94.9 | 99.9 | 81.9 | 88.3 |
+| DIVER [diver] | ResNet-34 | 98.5 | 96.5 | 94.9 | 100 | 82.6 | 88.3 |
+| DriveSuprim [drivesuprim] | ResNet-34 | 97.8 | 97.3 | 93.6 | 100 | 86.7 | 89.9 |
+| DiffusionDriveV2 [diffusiondrivev2] | ResNet-34 | 98.3 | 97.9 | 94.8 | 99.9 | 87.5 | 91.2 |
+| ipad [ipad] | ResNet-34 | 98.6 | 98.3 | 94.9 | 100 | 88.0 | 91.7 |
+| Hydra-MDP [hydramdp] | V2-99 | 98.4 | 97.8 | 93.9 | 100 | 86.5 | 90.3 |
+| GoalFlow [goalflow] | V2-99 | 98.4 | 98.3 | 94.6 | 100 | 85.0 | 90.3 |
+| SparseDriveV2 | ResNet-34 | 98.5 | 98.4 | 95.0 | 99.9 | 88.6 | **92.0** |
+
+> 表 2：论文中的 NAVSIM v1 leaderboard。为避免 markdown 渲染问题，这里去掉了原表的底色命令，仅保留数值；SparseDriveV2 的 PDMS 用加粗表示。
+
+如果把论文 Table 2 里的信息再多看一层，还能发现 SparseDriveV2 的领先并不是靠某一个子指标“单点拉高”。它在 NC、DAC、TTC、Comfort 和 EP 这些组成 PDMS 的核心维度上都表现稳定，尤其是 **EP（Ego Progress）** 指标更高，这和论文想强调的“更密的动作空间覆盖”是完全一致的。
+
+### 9.1 NAVSIM v1
+
+论文报告了：
+
+1. 92.0 PDMS。
+2. 90.1 EPDMS。
+
+在 v1 上，这意味着它不仅领先于典型 static scoring 方法，也超过了当下更受关注的 dynamic generation 和 hybrid 路线。
+
+### 9.2 NAVSIM v2
+
+在更严格的 v2 协议下，它仍然能拿到很强的 EPDMS，说明 factorized vocabulary + scalable scoring 并不是只对旧协议有效，而是对更复杂的评价体系也成立。
+
+如果对照原论文 Table 3，SparseDriveV2 在更新后的官方实现下达到 **90.1 EPDMS**，相比文中的 DiffusionDriveV2 **87.5 EPDMS** 高出 **2.6 分**。原文还专门指出，EP 指标的显著提升正是更高词表覆盖带来的直接收益。
+
+### 9.3 Bench2Drive
+
+在闭环驾驶里，论文给出了：
+
+1. 89.15 Driving Score。
+2. 70.00 Success Rate。
+
+如果只写这两个数字还不够完整，Bench2Drive 部分其实还体现了另一层信息：SparseDriveV2 不只是“能跑起来”，而是在 closed-loop benchmark 上展现了明显的泛化能力。论文还给出了 multi-ability 结果，其 mean score 达到 **67.67**，说明它在 merging、overtaking、emergency brake、give way 和 traffic sign 等不同交互能力上都不只是偶然命中。
+
+为了让这部分更完整，下面补一张 Bench2Drive 的简化对比表：
+
+| Method | Driving Score | Success Rate | Mean Ability |
+| --- | --- | --- | --- |
+| Hydra-NeXt | 73.86 | 50.00 | 53.22 |
+| SimLingo | 86.02 | 67.27 | - |
+| HiP-AD | 86.77 | 69.09 | 65.98 |
+| SparseDriveV2 | 89.15 | 70.00 | 67.67 |
+
+这说明它的“候选足够密 + 打分足够省”的设计，不只是 open-loop 指标漂亮，而是真的能够转化成闭环性能。
+
+对工程读者来说，这组结果最有价值的地方在于：**它证明了纯 scoring 路线并不天然落后于动态生成路线，关键差别在于词表覆盖和层次化打分有没有真正做到位。**
+
+### 9.4 论文里不可忽略的一部分：消融实验也支持主结论
+
+当前博客如果只写主结果，其实还少了一块很重要的证据链：论文的 ablation studies。
+
+Table 6 主要说明了两件事：
+
+1. **词表规模继续增大，性能就继续提升。**
+	例如从 $(N_p, N_v) = (512, 128)$ 到 $(1024, 256)$，EPDMS 从 88.7 提升到 90.1，没有出现明显饱和。
+2. **scalable scoring 里的具体实现选择同样重要。**
+	把 path-scene interaction 从普通 MHA 换成 deformable aggregation 会更好；再加入 trajectory re-conditioning，又会进一步提升结果。
+
+这组消融的价值在于，它证明 SparseDriveV2 的提升并不是单纯因为“词表大了”，而是“更大的词表”和“更合适的打分机制”是一起工作的。
+
+### 9.5 定性结果和失败案例也值得补一句
+
+论文附录里的定性图其实也很有代表性，至少能支持三条观察：
+
+1. 在 sharp-turn 场景里，SparseDriveV2 的轨迹更平滑。
+2. 在效率场景里，它比 baseline 更不容易无谓停车。
+3. 在高层意图对齐上，它更接近 expert trajectory。
+
+同时，论文并没有回避失败案例。附录中的 Figure 5 明确指出，在某些场景里 SparseDriveV2 仍然会做出错误的导航决策，作者给出的解释是 **navigation information 可能不足**。这一点很重要，因为它说明 SparseDriveV2 的瓶颈已经不完全是“候选空间不够密”，而开始转向更上层的任务条件和语义信息。
+
+---
+
+## 10. 落地路径：训练和评估入口该怎么找
+
+从仓库 README 和 `docs/train_eval.md` 来看，实际跑实验时你主要关心三件事：
+
+1. 环境准备。
+2. 数据缓存。
+3. 训练与评估脚本。
+
+如果按仓库结构来理解，推荐这样看：
+
+### 10.1 数据缓存
+
+先做缓存的目的很直接：把不需要每次重复计算的内容预先算好，避免训练时把时间浪费在 I/O 和重复特征抽取上。
+
+### 10.2 训练入口
+
+训练脚本统一放在 `scripts/` 下，README 里明确给了 `docs/train_eval.md` 作为主入口说明。
+
+### 10.3 评估入口
+
+评估同样从脚本层启动，再根据 NAVSIM 或 Bench2Drive 的协议输出最终指标。
+
+对这类项目来说，更高效的读法并不是“先扎进最底层模型代码”，而是先把 **数据准备、训练入口、评估协议** 这三件事串起来。SparseDriveV2 的仓库已经把这条链路尽量收敛到 README、docs 和 scripts 三个部分。
+
+如果进一步对照原文和仓库说明，NAVSIM 的典型实现配置也值得在博客里留一笔：
+
+1. path anchors 采样间隔为 1m，最大空间 horizon 为 50m。
+2. velocity profile 的时间间隔为 0.5s，规划 horizon 为 4s。
+3. scene feature 使用 ResNet-34，输入相机为 `l0 / f / r0`，分辨率 256×512。
+4. NAVSIM 训练通常使用 8 张 NVIDIA L20，total batch size 128，训练 10 epochs，learning rate 为 $1 \times 10^{-4}$，weight decay 为 0。
+
+这些数字不是无关紧要的实现细节，而是 SparseDriveV2 把“超密词表”和“可控算力”同时成立的关键约束条件。
+
+---
+
+## 11. 横向对比：如果和 DiffusionDriveV2 放在一起看，差异是什么
+
+虽然两者都属于端到端自动驾驶里的多模态规划路线，但思想重心明显不同：
+
+1. **DiffusionDriveV2** 更像是“生成式多模态规划”：重点是采样、扩散、RL、selector。
+2. **SparseDriveV2** 更像是“极致的 scoring-based planning”：重点是词表结构、候选密度、层次化打分。
+
+如果说 DiffusionDriveV2 关注的是“怎么生成出更好的候选”，那么 SparseDriveV2 关注的是“怎么把候选空间组织得更合理、把打分做得更高效”。
+
+这两条路线并不是互相否定，而是两个不同工程约束下的优化方向：
+
+1. 生成式路线更强调灵活性和样本质量提升。
+2. Scoring 路线更强调可控性、稳定性和推理效率。
+
+SparseDriveV2 的贡献在于，它把“静态词表”这条看似保守的路线，重新做成了一个既可以规模化、也可以逼近动态生成性能的强方案。
+
+如果再往前推一步看，SparseDriveV2 真正有价值的地方是：它迫使整个领域重新回答一个基础问题: **高性能规划到底必须依赖动态生成，还是足够好的结构化评分已经足够？** 论文给出的答案非常明确，至少在当前 benchmark 上，后者依然大有空间。
+
+---
+
+## 12. 阅读提示：读代码时最容易迷路的几个点
+
+如果你后面准备真的去翻仓库，最容易卡住的通常是这几个地方：
+
+1. **为什么 path 和 velocity 要先独立监督**：因为它们对应不同层次的驾驶语义，先分开学更容易收敛。
+2. **为什么要 top-k 两阶段筛选**：因为全量组合太贵，先粗排再精排是唯一合理的工程折中。
+3. **为什么 trajectory re-conditioning 还要再看 scene**：因为 path/velocity 组合只提供先验，真实可行性仍然要结合场景再判断。
+4. **为什么静态词表能赢动态生成方法**：因为一旦词表够密，动态生成的优势就不再是唯一解法，而高效打分和更强覆盖更关键。
+
+可以把 SparseDriveV2 的实现理解成一个三段式系统：
+
+1. 先把动作空间切开。
+2. 再把大候选集过滤掉。
+3. 最后只对少量高质量候选做高成本判别。
+
+---
+
+## 13. 总结：关于 SparseDriveV2，最值得带走的判断
+
+SparseDriveV2 证明了一件很重要的事：**当候选空间足够密、结构足够合理、打分足够高效时，scoring-based planning 不仅没有过时，反而仍然可以做到领先。**
+
+它不是靠更复杂的生成过程取胜，而是靠更好的词表结构和更聪明的候选筛选，把“静态候选集”做成了一个真正可扩展的规划系统。
+
+如果你从工程角度看自动驾驶规划，这篇论文最值得记住的不是某个单独公式，而是下面这条经验：
+
+> **要扩大规划能力，不一定先加大模型复杂度，也可以先重构动作空间。**
+
+---
+
+## 14. 后续阅读建议
+
+如果你接下来还想继续深挖，建议按这个顺序：
+
+1. 先把论文里的 Figure 1 和方法章节通读一遍，理解 path / velocity / trajectory 的三层关系。
+2. 再看仓库 `README.md` 和 `docs/train_eval.md`，确认训练和评估链路。
+3. 最后去对照 `navsim/` 里的实现，把 coarse scoring、top-k 选择和 fine-grained scoring 对上。
+
+这样读下来，你会比“先看公式、再找代码”更容易建立完整心智模型。
+
+---
+## 15. 附录：NAVSIM v1 指标定义
+
+上面第 9 章里的表格使用的是 NAVSIM v1 的 leaderboard 指标。为了方便对照，这里把 `NC ↑ | DAC ↑ | TTC ↑ | Comf. ↑ | EP ↑ | PDMS ↑` 逐一解释一下。
+
+### 15.1 指标总览
+
+| 缩写 | English name | 解释 | 含义 |
+| --- | --- | --- | --- |
+| NC | No Collision | 无碰撞率 | 表示规划轨迹是否避免与其他车辆、行人或静态障碍发生碰撞。数值越高越安全。 |
+| DAC | Drivable Area Compliance | 可行驶区域符合率 | 表示车辆轨迹有多大比例保持在可行驶区域内，避免压线、越界或驶出车道。数值越高越规范。 |
+| TTC | Time-To-Collision | 碰撞时间安全性 | 反映轨迹在前向安全距离和碰撞时间上的表现，数值越高表示越不容易进入危险接近状态。 |
+| Comf. | Comfort | 舒适性 | 衡量轨迹是否平滑，通常和加速度、加加速度（jerk）等有关。数值越高表示驾驶动作越平顺。 |
+| EP | Ego Progress | 自车进展 | 表示车辆沿任务路线向前推进的程度，越高说明规划越能有效完成路径进度。 |
+| PDMS | PDM Score | 综合规划评分 | NAVSIM v1 的最终聚合分数，由安全、合规、舒适和进展等子指标组合而成。 |
+
+### 15.2 PDMS 的公式
+
+论文给出的 NAVSIM v1 PDMS 计算方式为：
+
+$$
+\mathrm{PDMS} = \mathrm{NC} \times \mathrm{DAC} \times \frac{5\mathrm{TTC} + 2\mathrm{C} + 5\mathrm{EP}}{12}
+$$
+
+这里：
+
+1. `NC` 和 `DAC` 作为前置门控项，分别约束安全性和可行驶区域合规性。
+2. `TTC`、`C`、`EP` 则共同构成后面的加权项，分别对应安全性、舒适性和任务进展。
+3. 权重 `5 : 2 : 5` 表示 NAVSIM v1 更看重安全与进展，同时也保留舒适性的约束。
+
+### 15.3 每个指标怎么看
+
+1. **NC - No Collision**
+	- 这个指标最直观，关注的是“有没有撞上”。
+	- 在自动驾驶规划里，它是最基础的安全门槛。
+	- 如果 NC 低，说明轨迹虽然可能前进更快，但安全性已经不够。
+
+2. **DAC - Drivable Area Compliance**
+	- 这个指标关注“有没有跑出可行驶区域”。
+	- 它强调的是规则与车道约束，而不是单纯速度。
+	- 对端到端规划来说，DAC 高通常意味着轨迹更像人类驾驶。
+
+3. **TTC - Time-To-Collision**
+	- TTC 本质上衡量“距离潜在碰撞还有多远的时间”。
+	- 数值越高，说明系统在前向安全距离上更保守，也更不容易形成危险接近。
+	- 在 leaderboard 里，它常被看作安全裕度的一部分。
+
+4. **Comf. - Comfort**
+	- 舒适性通常和轨迹的平滑程度有关。
+	- 如果轨迹频繁急加速、急减速、急转向，Comfort 往往会下降。
+	- 这也是为什么论文强调 path / velocity 的结构化建模：它有助于生成更平稳的动作曲线。
+
+5. **EP - Ego Progress**
+	- EP 表示自车沿任务目标前进的程度。
+	- 这个指标不是“跑得越快越好”，而是看轨迹是否真正帮助车辆有效向前推进。
+	- SparseDriveV2 的提升里，EP 往往是最能体现“词表更密”收益的部分。
+
+6. **PDMS - PDM Score**
+	- PDMS 是 NAVSIM v1 的最终综合得分。
+	- 它把安全、合规、舒适和进展放在同一个评分体系里，因此比单一指标更接近真实驾驶质量。
+	- 论文里 SparseDriveV2 的 92.0 PDMS，说明它不是只在某一个维度上好看，而是在整体规划质量上也比较均衡。
+
+### 15.4 读表时可以怎么理解
+
+如果把这组指标放在一起看，可以把它们理解成四层约束：
+
+1. **先安全**：NC 和 TTC 先保证不出危险。
+2. **再合规**：DAC 保证轨迹没有跑偏。
+3. **再平顺**：Comfort 保证动作不突兀。
+4. **最后看进展**：EP 衡量是否真的推动了任务完成。
+
+这也是为什么 SparseDriveV2 的 table 里，某些方法单项分数很高，但最终 PDMS 仍然会拉开差距：leaderboard 看的是“能不能综合地开得好”，不是只看某一个局部指标。

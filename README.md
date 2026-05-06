@@ -720,3 +720,313 @@ python tools/eval_map_offline.py \
   /path/to/map_results.pkl \
   --eval chamfer --nproc 0
 ```
+
+---
+
+<a id="section-10-det-mapv2-deploy-plan"></a>
+## 10.det+mapv2 部署迁移预案（记录，暂不实施）
+
+本节记录一个未来工程：把当前仓库中的 `projects/configs/bevformer/bev_tiny_det_mapv2.py`
+迁移到 `Apollo-Vision-Net-Deployment/` 的 TensorRT/ONNX/Apollo 部署链路中。
+
+说明：
+
+- 当前 `Apollo-Vision-Net-Deployment/` 已经打通的是 **det+occ** 部署链路，而不是 det+mapv2。
+- 因此，这里记录的是一个“等模型稳定后再启动”的迁移方案，不代表当前代码已经支持。
+- 目标不是先做完整地图后处理，而是先做 **可导出、可跑通、可验证的 raw map tensor 输出**。
+
+### 10.1 现状结论
+
+当前部署仓库的导出链路是：
+
+1. 用 TRT 专用 cfg 构建模型，例如 `configs/apollo_bev/bev_tiny_det_occ_apollo_trt.py`
+2. 在 `tools/pth2onnx.py` 中调用 `det2trt.convert.pytorch2onnx(...)`
+3. 导出时强制切换到部署版前向，例如 `model.forward = model.forward_trt_occ_det`
+4. 依赖 `det2trt/` 下的 TRT 版 detector / head / transformer / attention 模块
+5. 生成的是 **面向 TensorRT/Apollo 的 ONNX**，而不是纯通用推理图
+
+当前已经存在、可复用的部署骨架：
+
+- `det2trt/models/detector/bevformer.py`
+- `det2trt/models/dense_heads/bevformer_head.py`
+- `det2trt/models/modules/transformer.py`
+- `det2trt/models/modules/encoder.py`
+- `det2trt/models/modules/temporal_self_attention.py`
+- `det2trt/models/modules/spatial_cross_attention.py`
+- `det2trt/models/modules/decoder.py`
+
+当前尚不存在的关键能力：
+
+- `BEVFormerDetMapHeadApolloTRT`
+- `BEVFormerDetMapHeadApolloV2TRT`
+- `MapTRv2DecoderTRT`
+- `MapTRv2DecoupledDetrTransformerDecoderLayerTRT`
+- det+mapv2 对应的 TRT cfg、导出前向、Apollo 侧 map 输出协议
+
+### 10.2 det+mapv2 迁移目标
+
+分阶段目标定义如下：
+
+阶段 A：最小导出闭环
+
+- 复用现有 BEVFormer TRT encoder/det decoder
+- 新增 mapv2 TRT 头
+- 成功导出 ONNX
+- ONNX 输出只包含原始 map 结果张量，不做复杂 Python 后处理
+
+阶段 B：TensorRT 闭环
+
+- 成功从 ONNX 构建 TensorRT engine
+- 在 x86 上完成 PyTorch / ONNX / TRT 数值对齐
+- 保持与 det+occ 相同的在线时序输入协议：`prev_bev + use_prev_bev + can_bus`
+
+阶段 C：Apollo 接入
+
+- 更新 Apollo 侧模型描述、输出解析与 postprocess
+- 支持 det+mapv2 输出替换 det+occ 的现有接口
+- 验证 Orin 上的实时性与稳定性
+
+### 10.3 推荐实施顺序
+
+建议严格按下面顺序推进，而不要一开始同时做导出、TRT、Apollo 接入：
+
+1. 先做 **det+mapv2 的 TRT 配置与 ONNX 导出**
+2. 再做 **TRT engine 构建与数值对齐**
+3. 最后做 **Apollo 侧 map 输出接入**
+
+理由：
+
+- `det+mapv2` 最先会卡在 decoder/head 导出兼容性，而不是 Apollo 侧逻辑
+- 如果 ONNX 和 TRT 都未稳定，Apollo 侧适配会反复返工
+- map 后处理天然更适合放在部署侧实现，不适合一开始强塞进导出图
+
+### 10.4 计划新增文件
+
+如果正式启动，建议最少新增以下文件：
+
+| 路径 | 作用 |
+|---|---|
+| `Apollo-Vision-Net-Deployment/configs/apollo_bev/bev_tiny_det_mapv2_apollo_trt.py` | det+mapv2 的 TRT 配置，定义模型类型、输入输出 shape、导出前向名 |
+| `Apollo-Vision-Net-Deployment/det2trt/models/dense_heads/bevformer_det_map_head_apollo.py` | TRT 版 det+map head（基础版） |
+| `Apollo-Vision-Net-Deployment/det2trt/models/dense_heads/bevformer_det_map_head_apollo_v2.py` | TRT 版 det+mapv2 head |
+| `Apollo-Vision-Net-Deployment/det2trt/models/modules/maptrv2_decoder.py` | TRT 版 MapTRv2 decoder 与 decoupled decoder layer |
+
+可选新增：
+
+| 路径 | 作用 |
+|---|---|
+| `Apollo-Vision-Net-Deployment/det2trt/models/detector/bevformer_det_map.py` | 若不想继续扩展通用 `BEVFormerTRT`，可单独放 det+map detector wrapper |
+
+### 10.5 推荐修改点
+
+#### 10.5.1 导出配置
+
+参考现有：
+
+- `Apollo-Vision-Net-Deployment/configs/apollo_bev/bev_tiny_det_occ_apollo_trt.py`
+
+新增 `bev_tiny_det_mapv2_apollo_trt.py` 时，建议：
+
+- `_base_` 指向一个普通 det+mapv2 cfg 的部署镜像
+- `model.type` 切到 `BEVFormerTRT`
+- `pts_bbox_head.type` 切到 `BEVFormerDetMapHeadApolloV2TRT`
+- 补充 `default_shapes` / `input_shapes` / `output_shapes`
+- 增加一个显式字段，例如：
+
+```python
+trt_forward = "forward_trt_det_map"
+```
+
+避免继续在导出脚本里写死 `forward_trt_occ_det`
+
+#### 10.5.2 导出脚本
+
+当前部署仓库里：
+
+```python
+model.forward = model.forward_trt_occ_det
+```
+
+建议改为按 cfg 选择：
+
+```python
+trt_forward = getattr(config, "trt_forward", "forward_trt_occ_det")
+model.forward = getattr(model, trt_forward)
+```
+
+这样 det+occ 和 det+mapv2 可以共用一套导出脚本。
+
+#### 10.5.3 detector wrapper
+
+现有 `det2trt/models/detector/bevformer.py` 已经支持：
+
+- `forward_trt(...)`
+- `forward_trt_occ_det(...)`
+
+建议新增：
+
+```python
+def forward_trt_det_map(self, image, prev_bev, use_prev_bev, can_bus, lidar2img, no_pad_image_shape):
+    ...
+    return bev_embed, outputs_classes, outputs_coords, map_cls_logits, map_pts
+```
+
+注意事项：
+
+- 只返回张量，不返回 Python dict/list
+- 保持和现有 det+occ 一样的在线时序输入协议
+- 让 `bev_embed` 继续作为下一帧 `prev_bev`
+
+#### 10.5.4 TRT 版 map head
+
+建议不要直接从训练版 `BEVFormerDetMapHeadApolloV2` 原样继承，而是采用“det TRT 基底 + map 分支迁移”的方式：
+
+- 以 `Apollo-Vision-Net-Deployment/det2trt/models/dense_heads/bevformer_head.py`
+  中的 `BEVFormerHeadTRT` 为检测基底
+- 从训练仓库的
+  `projects/mmdet3d_plugin/bevformer/dense_heads/bevformer_det_map_head_apollo.py`
+  和
+  `projects/mmdet3d_plugin/maptrv2/dense_heads/bevformer_det_map_head_apollo_v2.py`
+  迁移 map 分支逻辑
+
+最小可行版本只需要导出：
+
+- `map_cls_logits`
+- `map_pts`
+
+第一版先不要导出：
+
+- `one2many_outs`
+- `map_seg`
+- `map_pv_seg`
+- Python 风格 `get_map_results()`
+
+#### 10.5.5 TRT 版 MapTRv2 decoder
+
+训练版 V2 decoder 位于：
+
+- `projects/mmdet3d_plugin/maptrv2/modules/decoder.py`
+
+部署时至少需要迁移：
+
+- `MapTRv2Decoder`
+- `MapTRv2DecoupledDetrTransformerDecoderLayer`
+
+建议实现时优先复用现有部署仓库能力：
+
+- `CustomMSDeformableAttentionTRT`
+- `Group/MultiheadAttention` 的 TRT 兼容路径
+- 已经存在的 reshape/permute 风格
+
+最关键的工作是保证下面这条点级 query 路径在 TRT 版中仍成立：
+
+- `num_map_query = num_map_vec * map_num_pts`
+
+### 10.6 推荐的第一版 ONNX 输入输出
+
+第一版建议保持输入与 det+occ 一致，只替换输出。
+
+输入：
+
+- `image`: `[1, 6, 3, 480, 800]`
+- `prev_bev`: `[2500, 1, 256]`
+- `use_prev_bev`: `[1]`
+- `can_bus`: `[18]`
+- `lidar2img`: `[1, 6, 4, 4]`
+- `no_pad_image_shape`: `[2]`
+
+建议第一版输出：
+
+- `bev_embed`: `[2500, 1, 256]`
+- `outputs_classes`: `[6, 1, 900, 10]`
+- `outputs_coords`: `[6, 1, 900, 10]`
+- `map_cls_logits`: `[1, 50, 4]`
+- `map_pts`: `[1, 50, 20, 2]`
+
+说明：
+
+- `50` 来自 mapv2 的 `one-to-one` map queries
+- `300` 条 `one-to-many` 只服务训练，不建议作为部署输出
+- `20` 来自 `map_num_pts`
+- `4` 类对应 `divider/ped_crossing/boundary/centerline`
+
+### 10.7 为什么第一版不直接导出 `map_results`
+
+训练仓库中 `map_results` 是 Python 风格结构：
+
+- `vectors`
+- `scores`
+- `labels`
+- `cls_logits`
+
+这适合测试脚本，不适合部署图。
+
+部署第一版建议只导 raw tensors：
+
+- `map_cls_logits`
+- `map_pts`
+
+原因：
+
+- ONNX/TRT 图更稳定
+- Apollo 侧可用 C++ 实现阈值、筛选、重采样和发布协议
+- 后处理策略后续可独立迭代，不必重新导图
+
+### 10.8 第一阶段明确不做的事情
+
+为了把工程边界压小，第一阶段建议明确不做：
+
+1. 不导出 `one-to-many` map 输出
+2. 不导出 `map_aux_seg`（`map_seg` / `map_pv_seg`）
+3. 不在 ONNX 中实现 map postprocess
+4. 不做动态 batch
+5. 不做动态 camera 数
+6. 不把 Apollo 侧地图发布协议一起塞进第一轮开发
+
+### 10.9 风险点
+
+这项工程的主要风险不是 backbone，而是 map 分支：
+
+1. `MapTRv2DecoupledDetrTransformerDecoderLayer` 的双 self-attention 重排逻辑在 TensorRT 上可能出现 shape/性能问题
+2. `MultiheadAttention`、`CustomMSDeformableAttentionTRT` 与点级 query 组合后，可能出现 ONNX 或 TRT parser 不兼容
+3. Apollo 侧现有模型包和后处理明显按 det+occ 的 4 输出接口设计，切换到 det+mapv2 意味着 runtime 也要同步改
+
+因此，如果正式启动，必须遵守一个原则：
+
+- **先完成 ONNX 与 TRT 闭环，再做 Apollo 侧接入**
+
+### 10.10 触发实施前的前置条件
+
+在真正启动这项工程前，建议先满足下面条件：
+
+1. `bev_tiny_det_mapv2.py` 的训练与测试接口稳定
+2. `mapv2` 的推理输出 contract 不再频繁改动
+3. `one-to-one` 输出是否足够部署使用有明确结论
+4. 是否保留 `centerline` 类在部署侧已经达成一致
+5. Apollo 侧是否愿意接 raw map tensors 而不是现成 `map_results` 已经确认
+
+### 10.11 正式开工时的建议执行顺序
+
+建议到时候直接按下面顺序推进：
+
+1. 新增 `bev_tiny_det_mapv2_apollo_trt.py`
+2. 改造 `tools/pth2onnx.py` 支持按 cfg 选择 `trt_forward`
+3. 在部署仓库中补 `forward_trt_det_map`
+4. 实现最小 `BEVFormerDetMapHeadApolloV2TRT`
+5. 先完成 `pth -> onnx`
+6. 再完成 `onnx -> trt`
+7. 最后改 Apollo runtime 接入新输出
+
+建议暂停点：
+
+- 如果第 5 步无法稳定导出，先不要进入 Apollo 侧改造
+- 如果第 6 步 TRT 性能或兼容性不达标，优先缩小输出范围，不要先做后处理
+
+### 10.12 一句话版本
+
+未来如果要把 `bev_tiny_det_mapv2.py` 做成 Apollo 可部署版本，推荐路线不是“直接导训练模型”，而是：
+
+- **复用现有 det+occ 的 TRT 化 BEVFormer 骨架**
+- **新增 TRT 版 mapv2 head 和 decoder**
+- **第一版只导出 raw map tensors**
+- **等 ONNX/TRT 稳定后，再改 Apollo 侧接口**
