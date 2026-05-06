@@ -30,3 +30,10 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local temp / backups / archives
+.codex
+.docker_temp_*
+copilot_chat_backups/
+*.tar.xz
+*.tar.gz
