@@ -383,6 +383,64 @@ def _build_pred_boxes(
     return pred
 
 
+def _render_fallback_bev_plot(
+    nusc: NuScenes,
+    sample_token: str,
+    gt: EvalBoxes,
+    pred: EvalBoxes,
+    savepath: str,
+) -> None:
+    from nuscenes.utils.data_classes import Box
+    from pyquaternion import Quaternion
+    import matplotlib
+
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    def box_footprint_xy(box_like) -> tuple[np.ndarray, np.ndarray]:
+        box = Box(
+            center=np.asarray(box_like.translation, dtype=np.float64),
+            size=np.asarray(box_like.size, dtype=np.float64),
+            orientation=Quaternion(box_like.rotation),
+        )
+        corners = box.corners()
+        x = np.append(corners[0, :4], corners[0, 0])
+        y = np.append(corners[1, :4], corners[1, 0])
+        return x, y
+
+    gt_boxes = gt.boxes.get(sample_token, [])
+    pred_boxes = pred.boxes.get(sample_token, [])
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_aspect('equal')
+    ax.set_xlim([-60, 60])
+    ax.set_ylim([-60, 60])
+    ax.grid(True, alpha=0.18)
+    ax.set_xlabel('x (m)')
+    ax.set_ylabel('y (m)')
+    ax.scatter([0.0], [0.0], c='k', s=16, label='ego')
+
+    for box in gt_boxes:
+        x, y = box_footprint_xy(box)
+        ax.plot(x, y, color=(0.0, 0.75, 0.0, 0.28), linewidth=1.2)
+
+    for box in pred_boxes:
+        x, y = box_footprint_xy(box)
+        ax.plot(x, y, color=(0.0, 0.45, 1.0, 0.95), linewidth=2.0)
+        ax.text(float(box.translation[0]), float(box.translation[1]), f'{box.detection_name}:{box.detection_score:.2f}', fontsize=6, color=(0.0, 0.45, 1.0, 0.95))
+
+    handles = [
+        plt.Line2D([0], [0], color=(0.0, 0.75, 0.0, 0.7), lw=3, label='GT'),
+        plt.Line2D([0], [0], color=(0.0, 0.45, 1.0, 0.9), lw=3, label='Pred'),
+        plt.Line2D([0], [0], marker='o', color='k', lw=0, label='ego'),
+    ]
+    ax.legend(handles=handles, loc='upper right')
+    ax.set_title(f'Fallback det BEV | token={str(sample_token)[:8]}...')
+    fig.tight_layout()
+    fig.savefig(savepath + '.png', dpi=220)
+    plt.close(fig)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Visualize nuScenes det results as a BEV plot (single frame).'
@@ -559,7 +617,10 @@ def main() -> None:
     if save_prefix.endswith('_bev'):
         save_prefix = save_prefix[:-4]
 
-    visualize_sample(nusc, sample_token, gt, pred, savepath=save_prefix + '_bev')
+    try:
+        visualize_sample(nusc, sample_token, gt, pred, savepath=save_prefix + '_bev')
+    except FileNotFoundError:
+        _render_fallback_bev_plot(nusc, sample_token, gt, pred, save_prefix + '_bev')
 
     # `visualize_sample` will save as f"{savepath}.png". We normalize to args.out.
     produced = save_prefix + '_bev.png'
@@ -657,29 +718,31 @@ def main() -> None:
         pass
 
     # Optionally compose input image (top) + BEV (bottom).
-    if show_input and args.occ_root:
+    if show_input:
         try:
-            from PIL import Image
             import os.path as osp
             import imageio
 
-            input_path = _aligned_input_image_path(args.occ_root, args.thre, args.scene, args.frame)
             input_rgb = None
-            if osp.exists(input_path):
-                input_rgb = imageio.imread(input_path)
+            if args.occ_root:
+                input_path = _aligned_input_image_path(args.occ_root, args.thre, args.scene, args.frame)
+                if osp.exists(input_path):
+                    input_rgb = imageio.imread(input_path)
+                else:
+                    input_rgb = _load_input_mosaic_from_nuscenes(nusc, args.dataroot, sample_token, layout='grid')
+                stacked_out = os.path.splitext(_aligned_output_path(args.occ_root, args.thre, args.scene, args.frame))[0] + '_with_input.png'
             else:
                 input_rgb = _load_input_mosaic_from_nuscenes(nusc, args.dataroot, sample_token, layout='grid')
+                stacked_out = os.path.splitext(os.path.abspath(out_path))[0] + '_with_input.png'
 
-            # For aligned mode, the desired final output is always:
-            # <...>/{frame}_bev_det_with_input.png
-            stacked_out = os.path.splitext(_aligned_output_path(args.occ_root, args.thre, args.scene, args.frame))[0] + '_with_input.png'
             _compose_with_input_image(
                 bev_path=out_path,
                 out_path=stacked_out,
                 input_rgb=input_rgb,
                 top_height=args.input_height,
             )
-            # Delete the temporary BEV image so `{frame}_bev_det.png` is not left behind.
+
+            # Delete the temporary raw BEV image so the folder stays focused on the composed output.
             try:
                 if os.path.exists(out_path):
                     os.remove(out_path)
@@ -687,12 +750,13 @@ def main() -> None:
                 pass
 
             # Also remove any legacy plain output that might exist from previous runs.
-            try:
-                legacy_plain = _aligned_output_path(args.occ_root, args.thre, args.scene, args.frame)
-                if os.path.exists(legacy_plain):
-                    os.remove(legacy_plain)
-            except Exception:
-                pass
+            if args.occ_root:
+                try:
+                    legacy_plain = _aligned_output_path(args.occ_root, args.thre, args.scene, args.frame)
+                    if os.path.exists(legacy_plain):
+                        os.remove(legacy_plain)
+                except Exception:
+                    pass
         except Exception:
             pass
 

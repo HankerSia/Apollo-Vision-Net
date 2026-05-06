@@ -235,26 +235,47 @@ def draw_detection_box(
 
 def make_mosaic(images_by_cam: Dict[str, np.ndarray]) -> np.ndarray:
     panels = []
-    heights = [img.shape[0] for img in images_by_cam.values()]
-    target_h = min(heights)
     for cam in CAM_ORDER:
         img = images_by_cam[cam]
-        scale = target_h / img.shape[0]
-        target_w = max(1, int(round(img.shape[1] * scale)))
-        panel = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        cv2.rectangle(panel, (0, 0), (target_w, 36), (255, 255, 255), -1)
+        panel = img.copy()
+        cv2.rectangle(panel, (0, 0), (panel.shape[1], 36), (255, 255, 255), -1)
         cv2.putText(panel, cam, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
         panels.append(panel)
-    col_ws = [max(panels[i].shape[1] for i in pair) for pair in ((0, 3), (1, 4), (2, 5))]
 
-    def pad_w(img: np.ndarray, width: int) -> np.ndarray:
-        if img.shape[1] >= width:
+    row_heights = [max(panel.shape[0] for panel in panels[i:i + 3]) for i in (0, 3)]
+    col_widths = [max(panels[i].shape[1] for i in pair) for pair in ((0, 3), (1, 4), (2, 5))]
+
+    def pad_to(img: np.ndarray, height: int, width: int) -> np.ndarray:
+        pad_bottom = max(0, height - img.shape[0])
+        pad_right = max(0, width - img.shape[1])
+        if pad_bottom == 0 and pad_right == 0:
             return img
-        pad = np.full((img.shape[0], width - img.shape[1], 3), 255, dtype=np.uint8)
-        return np.concatenate([img, pad], axis=1)
+        return cv2.copyMakeBorder(
+            img,
+            0,
+            pad_bottom,
+            0,
+            pad_right,
+            borderType=cv2.BORDER_CONSTANT,
+            value=(255, 255, 255),
+        )
 
-    top = np.concatenate([pad_w(panels[0], col_ws[0]), pad_w(panels[1], col_ws[1]), pad_w(panels[2], col_ws[2])], axis=1)
-    bottom = np.concatenate([pad_w(panels[3], col_ws[0]), pad_w(panels[4], col_ws[1]), pad_w(panels[5], col_ws[2])], axis=1)
+    top = np.concatenate(
+        [
+            pad_to(panels[0], row_heights[0], col_widths[0]),
+            pad_to(panels[1], row_heights[0], col_widths[1]),
+            pad_to(panels[2], row_heights[0], col_widths[2]),
+        ],
+        axis=1,
+    )
+    bottom = np.concatenate(
+        [
+            pad_to(panels[3], row_heights[1], col_widths[0]),
+            pad_to(panels[4], row_heights[1], col_widths[1]),
+            pad_to(panels[5], row_heights[1], col_widths[2]),
+        ],
+        axis=1,
+    )
     return np.concatenate([top, bottom], axis=0)
 
 
@@ -343,7 +364,7 @@ def project_one_index(
         }
 
     mosaic = make_mosaic(images_by_cam)
-    mosaic_path = out_dir / 'projected_idx_overlay_grid.jpg'
+    mosaic_path = out_dir / 'projected_idx_overlay_grid.png'
     cv2.imwrite(str(mosaic_path), mosaic)
     metadata['mosaic'] = str(mosaic_path)
 
