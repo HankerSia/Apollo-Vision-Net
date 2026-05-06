@@ -7,6 +7,11 @@ Usage example:
     --results test/bev_tiny_det_map_apollo/Tue_Mar_10_15_19_32_2026/map_results.pkl \
     --index 50 \
     --out tools_outputs/det_map_vis_epoch12/map_idx050.png
+
+    python tools/analysis_tools/vis_map_pred_single.py \
+        --results tools_outputs/mock_maptrv2/mock_nuscmap_results.json \
+        --out tools_outputs/mock_maptrv2/mock_vis.png \
+        --skip-gt
 """
 
 from __future__ import annotations
@@ -31,8 +36,10 @@ if REPO_ROOT not in sys.path:
 
 from projects.mmdet3d_plugin.datasets.nuscenes_det_occ_map_dataset import (
     LiDARInstanceLines,
-    VectorizedLocalMap,
     _scene_name_to_log_location,
+)
+from projects.mmdet3d_plugin.datasets.nuscenes_det_mapv2_dataset import (
+    VectorizedLocalMapV2,
 )
 
 
@@ -40,13 +47,17 @@ LABEL2NAME = {
     0: 'divider',
     1: 'ped_crossing',
     2: 'boundary',
+    3: 'centerline',
 }
 
 LABEL2COLOR = {
     0: '#1f77b4',
     1: '#ff7f0e',
     2: '#2ca02c',
+    3: '#d62728',
 }
+
+NAME2LABEL = {name: label for label, name in LABEL2NAME.items()}
 
 
 def _load_input_mosaic_from_nuscenes(nusc: NuScenes, dataroot: str, sample_token: str):
@@ -164,7 +175,7 @@ def _build_lidar2global(info: dict) -> np.ndarray:
     return ego2global @ lidar2ego
 
 
-def _load_gt(vmap: VectorizedLocalMap, info: dict):
+def _load_gt(vmap: VectorizedLocalMapV2, info: dict, version: str):
     location = info.get('map_location', None)
     if location is None:
         scene_name = info.get('scene_name', None)
@@ -173,7 +184,7 @@ def _load_gt(vmap: VectorizedLocalMap, info: dict):
         location = _scene_name_to_log_location(
             scene_name,
             dataroot=vmap.data_root,
-            version='v1.0-trainval',
+            version=version,
         ) or scene_name
 
     lidar2global = _build_lidar2global(info)
@@ -191,20 +202,68 @@ def _load_gt(vmap: VectorizedLocalMap, info: dict):
     return labels, pts
 
 
-def _load_pred(result: dict):
-    pts = np.asarray(result['vectors'], dtype=np.float32)
-    scores = np.asarray(result['scores'], dtype=np.float32).reshape(-1)
-    labels = np.asarray(result['labels'], dtype=np.int64).reshape(-1)
-    return labels, scores, pts
+def _load_pred(result):
+    if isinstance(result, dict) and 'vectors' in result and 'scores' in result and 'labels' in result:
+        pts = np.asarray(result['vectors'], dtype=np.float32)
+        scores = np.asarray(result['scores'], dtype=np.float32).reshape(-1)
+        labels = np.asarray(result['labels'], dtype=np.int64).reshape(-1)
+        return labels, scores, pts
+
+    if isinstance(result, dict) and 'vectors' in result:
+        vectors = result['vectors']
+        labels = []
+        scores = []
+        pts = []
+        for vec in vectors:
+            pts.append(np.asarray(vec['pts'], dtype=np.float32))
+            scores.append(float(vec.get('confidence_level', 1.0)))
+            if 'type' in vec:
+                labels.append(int(vec['type']))
+            else:
+                labels.append(int(NAME2LABEL.get(vec.get('cls_name', 'divider'), 0)))
+        if len(pts) == 0:
+            return np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.float32), np.zeros((0, 0, 2), dtype=np.float32)
+        return np.asarray(labels, dtype=np.int64), np.asarray(scores, dtype=np.float32), np.asarray(pts, dtype=np.float32)
+
+    raise TypeError(f'Unsupported result format: {type(result)!r}')
+
+
+def _load_info_record(infos, index: int, sample_token: str | None):
+    if infos is None:
+        return {
+            'token': sample_token or f'mock_{index:04d}',
+            'scene_name': 'mock_scene',
+        }
+
+    if sample_token is not None:
+        for info in infos:
+            if info.get('token') == sample_token:
+                return info
+        raise KeyError(f'sample token not found in infos: {sample_token}')
+
+    return infos[index]
+
+
+def _load_result_record(results, index: int, sample_token: str | None):
+    if isinstance(results, dict) and 'results' in results:
+        records = results['results']
+        if sample_token is not None:
+            for record in records:
+                if record.get('sample_token') == sample_token:
+                    return record
+            raise KeyError(f'sample token not found in results: {sample_token}')
+        return records[index]
+    return results[index]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Visualize one map prediction sample.')
-    parser.add_argument('--data-root', required=True)
+    parser.add_argument('--data-root', default='data/nuscenes')
     parser.add_argument('--version', default='v1.0-trainval')
-    parser.add_argument('--infos', required=True)
+    parser.add_argument('--infos', default=None)
     parser.add_argument('--results', required=True)
-    parser.add_argument('--index', type=int, required=True)
+    parser.add_argument('--index', type=int, default=0)
+    parser.add_argument('--sample-token', default=None)
     parser.add_argument('--out', required=True)
     parser.add_argument('--patch-h', type=float, default=100.0)
     parser.add_argument('--patch-w', type=float, default=100.0)
@@ -213,21 +272,25 @@ def main() -> None:
     parser.add_argument('--topk', type=int, default=30)
     parser.add_argument('--with-input', action='store_true')
     parser.add_argument('--input-height', type=int, default=260)
+    parser.add_argument('--skip-gt', action='store_true')
     args = parser.parse_args()
 
-    infos = mmcv.load(args.infos)['infos']
+    infos = mmcv.load(args.infos)['infos'] if args.infos else None
     results = mmcv.load(args.results)
-    info = infos[args.index]
-    result = results[args.index]
+    info = _load_info_record(infos, args.index, args.sample_token)
+    result = _load_result_record(results, args.index, args.sample_token)
 
-    vmap = VectorizedLocalMap(
-        dataroot=args.data_root,
-        patch_size=(args.patch_h, args.patch_w),
-        map_classes=('divider', 'ped_crossing', 'boundary'),
-        fixed_ptsnum_per_line=args.fixed_pts,
-    )
+    gt_labels = np.zeros((0,), dtype=np.int64)
+    gt_pts = np.zeros((0, args.fixed_pts, 2), dtype=np.float32)
+    if not args.skip_gt and infos is not None:
+        vmap = VectorizedLocalMapV2(
+            dataroot=args.data_root,
+            patch_size=(args.patch_h, args.patch_w),
+            map_classes=('divider', 'ped_crossing', 'boundary', 'centerline'),
+            fixed_ptsnum_per_line=args.fixed_pts,
+        )
+        gt_labels, gt_pts = _load_gt(vmap, info, args.version)
 
-    gt_labels, gt_pts = _load_gt(vmap, info)
     pred_labels, pred_scores, pred_pts = _load_pred(result)
 
     keep = pred_scores >= float(args.score_thr)
@@ -278,7 +341,7 @@ def main() -> None:
     ax.legend(handles=handles, loc='upper right')
     ax.set_title(
         f"Map prediction idx={args.index} | scene={info.get('scene_name', 'n/a')} | "
-        f"token={info['token'][:8]}...\nkept={int(keep.sum())}/{len(pred_scores)} @ score>={args.score_thr}"
+        f"token={str(info.get('token', 'n/a'))[:8]}...\nkept={int(keep.sum())}/{len(pred_scores)} @ score>={args.score_thr}"
     )
     fig.tight_layout()
     fig.savefig(args.out, dpi=220)
