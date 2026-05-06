@@ -78,3 +78,8 @@ data = dict(
         map_classes=map_classes,
     ),
 )
+
+evaluation = dict(
+    interval=10,
+    map_metric=['chamfer', 'iou'],
+)

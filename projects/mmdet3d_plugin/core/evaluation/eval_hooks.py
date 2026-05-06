@@ -84,18 +84,43 @@ class CustomDistEvalHook(BaseDistEvalHook):
             print('\n')
             runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
 
-            # key_score = self.evaluate(runner, results)
             bbox_predictions = results['bbox_results']
+            map_predictions = results.get('map_results', None)
             occupancy_results = results['occupancy_results']
             flow_results = results['flow_results']
-            
+            eval_results = {}
+
             if occupancy_results is not None:
-                self.dataloader.dataset.evaluate_occ_iou(occupancy_results, 
-                                                         flow_results, 
+                self.dataloader.dataset.evaluate_occ_iou(occupancy_results,
+                                                         flow_results,
                                                          occ_threshold=0.25,
                                                          runner=runner)
             if bbox_predictions is not None:
-                key_score = self.evaluate(runner, bbox_predictions)
-                if self.save_best:
-                    self._save_ckpt(runner, key_score)
-    
+                bbox_eval_kwargs = dict(getattr(self, 'eval_kwargs', {}))
+                bbox_eval_kwargs.pop('map_metric', None)
+                bbox_results = self.dataloader.dataset.evaluate(
+                    bbox_predictions, logger=runner.logger, **bbox_eval_kwargs)
+                eval_results.update(bbox_results)
+
+            if map_predictions is not None and hasattr(self.dataloader.dataset, 'evaluate_map'):
+                map_eval_kwargs = dict(getattr(self, 'eval_kwargs', {}))
+                map_metric = map_eval_kwargs.pop('map_metric', 'chamfer')
+                map_results = self.dataloader.dataset.evaluate_map(
+                    map_predictions,
+                    metric=map_metric,
+                    logger=runner.logger,
+                    **map_eval_kwargs)
+                eval_results.update(map_results)
+
+            for name, val in eval_results.items():
+                runner.log_buffer.output[name] = val
+            if eval_results:
+                runner.log_buffer.ready = True
+
+            if self.save_best and eval_results:
+                key_indicator = getattr(self, 'key_indicator', self.save_best)
+                if key_indicator == 'auto':
+                    key_indicator = next(iter(eval_results))
+                    self.key_indicator = key_indicator
+                if key_indicator in eval_results:
+                    self._save_ckpt(runner, eval_results[key_indicator])
