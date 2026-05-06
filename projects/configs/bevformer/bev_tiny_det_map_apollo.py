@@ -11,6 +11,31 @@ _base_ = [
 # Override the schedule's default runner (usually 20 epochs).
 runner = dict(type='EpochBasedRunner', max_epochs=100)
 
+optimizer = dict(type='AdamW', lr=1e-4, weight_decay=0.01)
+optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+
+lr_config = dict(
+    _delete_=True,
+    policy='CosineAnnealing',
+    warmup='linear',
+    warmup_iters=1000,
+    warmup_ratio=1.0 / 3,
+    min_lr_ratio=1e-3,
+)
+
+momentum_config = None
+
+evaluation = dict(
+    interval=1,
+    save_best='pts_bbox_NuScenes/NDS',
+    rule='greater',
+)
+
+checkpoint_config = dict(
+    interval=1,
+    max_keep_ckpts=10,
+)
+
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 

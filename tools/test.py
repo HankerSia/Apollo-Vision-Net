@@ -13,7 +13,6 @@ from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
                          wrap_fp16_model)
 
-from mmdet3d.apis import single_gpu_test
 from mmdet3d.datasets import build_dataset
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from mmdet3d.models import build_model
@@ -22,6 +21,65 @@ from projects.mmdet3d_plugin.bevformer.apis.test import custom_multi_gpu_test
 from mmdet.datasets import replace_ImageToTensor
 import time
 import os.path as osp
+
+
+def custom_single_gpu_test(model, data_loader, show=False, show_dir=None, occ_threshold=0.25):
+    """Single-GPU test that preserves det/map/occ outputs separately.
+
+    The project detector returns `(result_dict, occ_results)` during inference.
+    The upstream `mmdet3d.apis.single_gpu_test` assumes a plain list-like result,
+    so it flattens the tuple into an interleaved list and doubles the apparent
+    result length. That later breaks dataset evaluation.
+    """
+    model.eval()
+    dataset = data_loader.dataset
+    prog_bar = mmcv.ProgressBar(len(dataset))
+
+    bbox_results = []
+    map_results = []
+    occupancy_results = []
+    flow_results = []
+
+    for data in data_loader:
+        with torch.no_grad():
+            result, occ_results = model(
+                return_loss=False,
+                rescale=True,
+                occ_threshold=occ_threshold,
+                **data)
+
+        batch_size = 1
+        if isinstance(result, dict):
+            if 'bbox_results' in result and result['bbox_results'] is not None:
+                bbox_result = result['bbox_results']
+                batch_size = len(bbox_result)
+                bbox_results.extend(bbox_result)
+            if 'map_results' in result and result['map_results'] is not None:
+                map_result = result['map_results']
+                if isinstance(map_result, list):
+                    map_results.extend(map_result)
+                else:
+                    map_results.append(map_result)
+        elif result is not None:
+            batch_size = len(result)
+            bbox_results.extend(result)
+
+        occupancy_preds = occ_results.get('occupancy_preds', None)
+        flow_preds = occ_results.get('flow_preds', None)
+        if occupancy_preds is not None:
+            occupancy_results.extend([occupancy_preds])
+        if flow_preds is not None:
+            flow_results.extend([flow_preds])
+
+        for _ in range(batch_size):
+            prog_bar.update()
+
+    return {
+        'bbox_results': bbox_results if len(bbox_results) else None,
+        'map_results': map_results if len(map_results) else None,
+        'occupancy_results': occupancy_results if len(occupancy_results) else None,
+        'flow_results': flow_results if len(flow_results) else None,
+    }
 
 
 def parse_args():
@@ -223,12 +281,8 @@ def main():
     # add occupancy prediction
     if not distributed:
         model = MMDataParallel(model, device_ids=[0])
-        outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
-        results = {
-            'bbox_results': outputs,
-            'occupancy_results': None,
-            'flow_results': None,
-        }
+        results = custom_single_gpu_test(
+            model, data_loader, args.show, args.show_dir)
         occ_thresholds = [0.25]
     else:
         model = MMDistributedDataParallel(

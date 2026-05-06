@@ -202,6 +202,11 @@ def format_res_gt_by_classes(
     cls_gens: Dict[str, Tuple[np.ndarray, ...]] = {}
     cls_gts: Dict[str, Tuple[np.ndarray, ...]] = {}
 
+    print(
+        f'[map_eval] formatting class-wise inputs: '
+        f'num_samples={len(gen_results)} num_classes={len(cls_names)} nproc={nproc}'
+    )
+
     if nproc and nproc > 1:
         args = [
             (
@@ -222,6 +227,7 @@ def format_res_gt_by_classes(
             _, gens, gts = out[class_id]
             cls_gens[clsname] = gens
             cls_gts[clsname] = gts
+            print(f'[map_eval] formatted class={clsname} ({class_id + 1}/{len(cls_names)})')
     else:
         for class_id, clsname in enumerate(cls_names):
             _, gens, gts = _format_res_gt_by_class_worker(
@@ -236,8 +242,10 @@ def format_res_gt_by_classes(
             )
             cls_gens[clsname] = gens
             cls_gts[clsname] = gts
+            print(f'[map_eval] formatted class={clsname} ({class_id + 1}/{len(cls_names)})')
 
     mmcv.dump([cls_gens, cls_gts], cache_path)
+    print(f'[map_eval] wrote formatted cache to {cache_path}')
     return cls_gens, cls_gts
 
 
@@ -260,7 +268,11 @@ def eval_map(
 
     eval_results = []
 
-    for clsname in cls_names:
+    for cls_idx, clsname in enumerate(cls_names):
+        print(
+            f'[map_eval] metric={metric} threshold={float(threshold):.2f} '
+            f'class={clsname} ({cls_idx + 1}/{len(cls_names)})'
+        )
         per_sample_gens = cls_gens[clsname]
         per_sample_gts = cls_gts[clsname]
 

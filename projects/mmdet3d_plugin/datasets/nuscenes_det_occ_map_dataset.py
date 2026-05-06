@@ -588,7 +588,7 @@ class CustomNuScenesDetOccMapDataset(CustomNuScenesDataset):
         map_ann_file=None,
         pc_range=None,
         eval_use_same_gt_sample_num_flag=True,
-        map_eval_nproc=8,
+        map_eval_nproc=0,
         *args,
         **kwargs,
     ):
@@ -599,6 +599,13 @@ class CustomNuScenesDetOccMapDataset(CustomNuScenesDataset):
 
         # ---- MapTR-aligned evaluation settings ----
         self.eval_use_same_gt_sample_num_flag = eval_use_same_gt_sample_num_flag
+        # NOTE:
+        # Map evaluation used to default to multi-process mode. In practice,
+        # repeated `Pool(...)` creation inside the MapTR-style evaluation loop
+        # can stall for a very long time or appear hung on some environments.
+        # Default to single-process for robustness; callers can still override
+        # this via cfg (`map_eval_nproc`) when they have verified the local
+        # multiprocessing path is stable.
         self.map_eval_nproc = int(map_eval_nproc) if map_eval_nproc is not None else 0
         default_pc_range = getattr(self, 'point_cloud_range', [-50.0, -50.0, -5.0, 50.0, 50.0, 3.0])
         self.pc_range = list(pc_range) if pc_range is not None else list(default_pc_range)
@@ -697,6 +704,10 @@ class CustomNuScenesDetOccMapDataset(CustomNuScenesDataset):
 
             cls_aps = np.zeros((len(thresholds), len(self.MAPCLASSES)), dtype=np.float64)
             for i, thr in enumerate(thresholds):
+                print(
+                    f'[map_eval] metric={m} threshold={float(thr):.2f} '
+                    f'({i + 1}/{len(thresholds)}) nproc={max(self.map_eval_nproc, 0)}'
+                )
                 mAP, cls_ap = eval_map(
                     gen_results,
                     annotations,
