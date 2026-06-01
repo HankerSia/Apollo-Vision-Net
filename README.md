@@ -17,6 +17,18 @@
 - `[Modified]` `projects/mmdet3d_plugin/bevformer/hooks/det_map_text_logger_hook.py`
   - logger 兼容新的 `map_*` 汇总字段，保证 `map_main_total`、`map_total`、`map_o2m_*` 仍按 map 分类输出。
 
+- `[Modified]` `projects/mmdet3d_plugin/core/evaluation/eval_hooks.py`
+  - 修复训练期分布式评估阶段的 rank 同步问题：此前 `CustomDistEvalHook` 只在 rank 0 执行 `dataset.evaluate()` / `evaluate_map()`，其他 rank 在结果收集后会提前回到训练循环。
+  - 当 rank 0 仍在执行耗时 bbox/map 评估时，非 0 rank 进入下一轮训练 loss，触发 `reduce_mean` / `all_reduce` 等 collective；由于 rank 0 未参与同一 collective，最终出现 `Watchdog caught collective operation timeout: WorkNCCL(OpType=ALLREDUCE, Timeout(ms)=1800000)`。
+  - 新增基于 `.eval_hook_sync` 的文件哨兵同步：rank 0 完整完成 bbox/map 评估与 `save_best` 后写入 `.done`；若评估异常则写入 `.fail`；非 0 rank 在 CPU 侧轮询等待，不再提前进入下一轮训练。
+  - 该同步刻意不使用 `dist.barrier()`：map 评估可能超过 NCCL 默认 30 分钟 watchdog，长时间占用 NCCL collective 仍可能触发超时；文件哨兵只用于训练循环重入前的跨 rank 对齐。
+  - 可通过环境变量调整等待行为：`AVN_EVAL_SYNC_TIMEOUT` 控制最长等待秒数（默认 24 小时），`AVN_EVAL_SYNC_POLL_INTERVAL` 控制轮询间隔秒数（默认 5 秒）。
+
+- 评估阶段 NCCL timeout 的判定与处理建议
+  - 典型日志特征：det bbox 评估已完成并打印 `mAP/NDS`，随后进入 `[map_eval] formatting class-wise inputs` 或 map 指标计算；同时非 0 rank 报 `ALLREDUCE` timeout，并伴随 `[det_map][det] loss failed` / `[det_map][maptr_official] map loss failed`。
+  - 这类报错不表示 loss 本身先出错，而是非 0 rank 已经提前进入下一轮训练 loss，同步等待不到仍在评估的 rank 0。
+  - 若异常退出后 `nvidia-smi` 显示部分 GPU 显存未释放但 Processes 为空，通常是容器/驱动侧残留 CUDA 上下文；先用 `fuser -v /dev/nvidia*` 查占用，必要时重启容器，或在确认无其他任务时执行 `nvidia-smi --gpu-reset -i <gpu_ids>`。
+
 - 当前建议读取的 map 日志字段
   - `map_total`：地图分支综合损失
   - `map_main_total`：one-to-one 主分支损失和

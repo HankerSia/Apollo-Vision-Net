@@ -9,9 +9,18 @@ _base_ = [
 
 # Smoke-test only: keep runtime short.
 # Override the schedule's default runner (usually 20 epochs).
-runner = dict(type='EpochBasedRunner', max_epochs=100)
+runner = dict(type='EpochBasedRunner', max_epochs=200)
 
-optimizer = dict(type='AdamW', lr=1e-4, weight_decay=0.01)
+# Scale LR linearly with the configured per-GPU batch size.
+samples_per_gpu = 2
+base_samples_per_gpu = 2
+base_lr = 1e-4
+
+optimizer = dict(
+    type='AdamW',
+    lr=base_lr * samples_per_gpu / base_samples_per_gpu,
+    weight_decay=0.01,
+)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 
 lr_config = dict(
@@ -75,8 +84,8 @@ bev_h_ = 50
 bev_w_ = 50
 queue_length = 3
 # GroupMultiheadAttention requires `num_query % group == 0` during training.
-# We keep `group=1` for both stages to ensure correctness.
-group_detr = 1
+# Use a larger valid group size for the default `num_query=900`.
+group_detr = 10
 
 model = dict(
     type='BEVFormer',
@@ -309,7 +318,7 @@ data = dict(
     # For temporal BEVFormer, each dataset item already contains a queue of
     # frames stacked into `img` (see CustomNuScenesDataset.union2one). Keep
     # batch size 1 for minimal forward smoke tests.
-    samples_per_gpu=2,
+    samples_per_gpu=samples_per_gpu,
     workers_per_gpu=4,
     # Required by projects/mmdet3d_plugin/bevformer/apis/mmdet_train.py
     shuffler_sampler=dict(type='DistributedGroupSampler'),

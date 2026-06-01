@@ -5,8 +5,12 @@ import argparse
 from unittest import result
 import mmcv
 import os
+import sys
 import torch
 import warnings
+
+sys.path.insert(0, os.getcwd())
+
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
@@ -21,6 +25,8 @@ from projects.mmdet3d_plugin.bevformer.apis.test import custom_multi_gpu_test
 from mmdet.datasets import replace_ImageToTensor
 import time
 import os.path as osp
+
+from auto_prepare_maptrv2_data import maybe_prepare_maptrv2_data
 
 
 def custom_single_gpu_test(model, data_loader, show=False, show_dir=None, occ_threshold=0.25):
@@ -245,6 +251,8 @@ def main():
     if args.seed is not None:
         set_random_seed(args.seed, deterministic=args.deterministic)
 
+    maybe_prepare_maptrv2_data(cfg)
+
     # build the dataloader
     dataset = build_dataset(cfg.data.test)
     data_loader = build_dataloader(
@@ -331,6 +339,8 @@ def main():
                         'rule'
                 ]:
                     eval_kwargs.pop(key, None)
+                # `map_metric` is used by map evaluation, not bbox evaluate().
+                eval_kwargs.pop('map_metric', None)
 
                 eval_kwargs.update(dict(metric=args.eval, **kwargs))
                 if occupancy_results is not None and 'iou' in args.eval:

@@ -4,7 +4,6 @@ import numpy as np
 from mmdet.datasets import DATASETS
 from nuscenes.eval.common.utils import quaternion_yaw, Quaternion
 from shapely.geometry import LineString
-from shapely.errors import TopologicalError
 
 from .nuscenes_det_occ_map_dataset import CustomNuScenesDetMapDataset
 from .nuscenes_det_occ_map_dataset import VectorizedLocalMap
@@ -137,16 +136,9 @@ class VectorizedLocalMapV2(VectorizedLocalMap):
             if polygon_token is None:
                 continue
             polygon = map_api.extract_polygon(polygon_token)
-            try:
-                if not polygon.is_valid:
-                    polygon = polygon.buffer(0)
-                new_polygon = polygon.intersection(patch)
-            except TopologicalError:
-                try:
-                    new_polygon = polygon.buffer(0).intersection(patch)
-                except Exception:
-                    continue
-
+            if not polygon.is_valid:
+                continue
+            new_polygon = polygon.intersection(patch)
             if new_polygon.is_empty:
                 continue
 
@@ -193,30 +185,26 @@ class VectorizedLocalMapV2(VectorizedLocalMap):
 
         for value in centerline_geoms.values():
             centerline_geom = value['centerline']
-            if centerline_geom.is_empty:
-                continue
             if centerline_geom.geom_type == 'MultiLineString':
                 start_pt = np.array(centerline_geom.geoms[0].coords).round(3)[0]
                 end_pt = np.array(centerline_geom.geoms[-1].coords).round(3)[-1]
                 for single_geom in centerline_geom.geoms:
                     single_geom_pts = np.array(single_geom.coords).round(3)
-                    for idx in range(max(len(single_geom_pts) - 1, 0)):
+                    for idx in range(len(single_geom_pts) - 1):
                         pts_graph.add_edge(tuple(single_geom_pts[idx]), tuple(single_geom_pts[idx + 1]))
             elif centerline_geom.geom_type == 'LineString':
                 centerline_pts = np.array(centerline_geom.coords).round(3)
                 start_pt = centerline_pts[0]
                 end_pt = centerline_pts[-1]
-                for idx in range(max(len(centerline_pts) - 1, 0)):
+                for idx in range(len(centerline_pts) - 1):
                     pts_graph.add_edge(tuple(centerline_pts[idx]), tuple(centerline_pts[idx + 1]))
             else:
-                continue
+                raise NotImplementedError
 
             for pred in value['incoming_tokens']:
                 if pred not in centerline_geoms:
                     continue
                 pred_geom = centerline_geoms[pred]['centerline']
-                if pred_geom.is_empty:
-                    continue
                 if pred_geom.geom_type == 'MultiLineString':
                     pred_pt = np.array(pred_geom.geoms[-1].coords).round(3)[-1]
                 else:
@@ -227,8 +215,6 @@ class VectorizedLocalMapV2(VectorizedLocalMap):
                 if succ not in centerline_geoms:
                     continue
                 succ_geom = centerline_geoms[succ]['centerline']
-                if succ_geom.is_empty:
-                    continue
                 if succ_geom.geom_type == 'MultiLineString':
                     succ_pt = np.array(succ_geom.geoms[0].coords).round(3)[0]
                 else:
@@ -237,27 +223,14 @@ class VectorizedLocalMapV2(VectorizedLocalMap):
 
         roots = [node for node, degree in pts_graph.in_degree() if degree == 0]
         leaves = [node for node, degree in pts_graph.out_degree() if degree == 0]
-        if not roots or not leaves:
-            centerline_instances = []
-            for value in centerline_geoms.values():
-                geom = value['centerline']
-                if geom.geom_type == 'MultiLineString':
-                    centerline_instances.extend([g for g in geom.geoms if not g.is_empty])
-                elif geom.geom_type == 'LineString' and not geom.is_empty:
-                    centerline_instances.append(geom)
-            return centerline_instances, pts_graph
-
         all_paths = []
         for root in roots:
             all_paths.extend(nx.all_simple_paths(pts_graph, root, leaves))
 
         final_centerline_paths = []
         for path in all_paths:
-            if len(path) < 2:
-                continue
             merged_line = LineString(path).simplify(0.2, preserve_topology=True)
-            if not merged_line.is_empty:
-                final_centerline_paths.append(merged_line)
+            final_centerline_paths.append(merged_line)
         return final_centerline_paths, pts_graph
 
 

@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../MapTR-maptrv2"
+		},
+		{
+			"path": "../GenMapFuse"
+		}
+	],
+	"settings": {}
+}

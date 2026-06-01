@@ -16,6 +16,7 @@ from mmcv import Config, DictAction
 from mmcv.runner import get_dist_info, init_dist
 from os import path as osp
 
+from auto_prepare_maptrv2_data import maybe_prepare_maptrv2_data
 from mmdet import __version__ as mmdet_version
 from mmdet3d import __version__ as mmdet3d_version
 #from mmdet3d.apis import train_model
@@ -212,6 +213,8 @@ def main():
     # log some basic info
     logger.info(f'Distributed training: {distributed}')
     logger.info(f'Config:\n{cfg.pretty_text}')
+
+    maybe_prepare_maptrv2_data(cfg, logger=logger)
 
     # set random seeds
     if args.seed is not None:

@@ -4,7 +4,9 @@
 # inherit EvalHook but BaseDistEvalHook.
 
 import bisect
+import os
 import os.path as osp
+import time
 
 import mmcv
 import torch.distributed as dist
@@ -51,6 +53,30 @@ class CustomDistEvalHook(BaseDistEvalHook):
         self._decide_interval(runner)
         super().before_train_iter(runner)
 
+    def _eval_sync_paths(self, runner):
+        sync_dir = osp.join(runner.work_dir, '.eval_hook_sync')
+        eval_id = f'epoch_{runner.epoch}_iter_{runner.iter}'
+        return (
+            sync_dir,
+            osp.join(sync_dir, f'{eval_id}.done'),
+            osp.join(sync_dir, f'{eval_id}.fail'),
+        )
+
+    def _wait_for_rank0_eval(self, runner, done_path, fail_path):
+        timeout = float(os.environ.get('AVN_EVAL_SYNC_TIMEOUT', 24 * 60 * 60))
+        poll_interval = float(os.environ.get('AVN_EVAL_SYNC_POLL_INTERVAL', 5))
+        start_time = time.time()
+        while True:
+            if osp.exists(done_path):
+                return
+            if osp.exists(fail_path):
+                raise RuntimeError(
+                    f'rank 0 evaluation failed; see log and {fail_path}')
+            if time.time() - start_time > timeout:
+                raise TimeoutError(
+                    f'timed out waiting for rank 0 evaluation sync: {done_path}')
+            time.sleep(poll_interval)
+
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
         # Synchronization of BatchNorm's buffer (running_mean
@@ -69,6 +95,13 @@ class CustomDistEvalHook(BaseDistEvalHook):
         if not self._should_evaluate(runner):
             return
 
+        sync_dir, done_path, fail_path = self._eval_sync_paths(runner)
+        if runner.rank == 0:
+            mmcv.mkdir_or_exist(sync_dir)
+            for path in (done_path, fail_path):
+                if osp.exists(path):
+                    os.remove(path)
+
         tmpdir = self.tmpdir
         if tmpdir is None:
             tmpdir = osp.join(runner.work_dir, '.eval_hook')
@@ -81,46 +114,56 @@ class CustomDistEvalHook(BaseDistEvalHook):
             tmpdir=tmpdir,
             gpu_collect=self.gpu_collect)
         if runner.rank == 0:
-            print('\n')
-            runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
+            try:
+                print('\n')
+                runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
 
-            bbox_predictions = results['bbox_results']
-            map_predictions = results.get('map_results', None)
-            occupancy_results = results['occupancy_results']
-            flow_results = results['flow_results']
-            eval_results = {}
+                bbox_predictions = results['bbox_results']
+                map_predictions = results.get('map_results', None)
+                occupancy_results = results['occupancy_results']
+                flow_results = results['flow_results']
+                eval_results = {}
 
-            if occupancy_results is not None:
-                self.dataloader.dataset.evaluate_occ_iou(occupancy_results,
-                                                         flow_results,
-                                                         occ_threshold=0.25,
-                                                         runner=runner)
-            if bbox_predictions is not None:
-                bbox_eval_kwargs = dict(getattr(self, 'eval_kwargs', {}))
-                bbox_eval_kwargs.pop('map_metric', None)
-                bbox_results = self.dataloader.dataset.evaluate(
-                    bbox_predictions, logger=runner.logger, **bbox_eval_kwargs)
-                eval_results.update(bbox_results)
+                if occupancy_results is not None:
+                    self.dataloader.dataset.evaluate_occ_iou(occupancy_results,
+                                                             flow_results,
+                                                             occ_threshold=0.25,
+                                                             runner=runner)
+                if bbox_predictions is not None:
+                    bbox_eval_kwargs = dict(getattr(self, 'eval_kwargs', {}))
+                    bbox_eval_kwargs.pop('map_metric', None)
+                    bbox_results = self.dataloader.dataset.evaluate(
+                        bbox_predictions, logger=runner.logger, **bbox_eval_kwargs)
+                    eval_results.update(bbox_results)
 
-            if map_predictions is not None and hasattr(self.dataloader.dataset, 'evaluate_map'):
-                map_eval_kwargs = dict(getattr(self, 'eval_kwargs', {}))
-                map_metric = map_eval_kwargs.pop('map_metric', 'chamfer')
-                map_results = self.dataloader.dataset.evaluate_map(
-                    map_predictions,
-                    metric=map_metric,
-                    logger=runner.logger,
-                    **map_eval_kwargs)
-                eval_results.update(map_results)
+                if map_predictions is not None and hasattr(self.dataloader.dataset, 'evaluate_map'):
+                    map_eval_kwargs = dict(getattr(self, 'eval_kwargs', {}))
+                    map_metric = map_eval_kwargs.pop('map_metric', 'chamfer')
+                    map_results = self.dataloader.dataset.evaluate_map(
+                        map_predictions,
+                        metric=map_metric,
+                        logger=runner.logger,
+                        **map_eval_kwargs)
+                    eval_results.update(map_results)
 
-            for name, val in eval_results.items():
-                runner.log_buffer.output[name] = val
-            if eval_results:
-                runner.log_buffer.ready = True
+                for name, val in eval_results.items():
+                    runner.log_buffer.output[name] = val
+                if eval_results:
+                    runner.log_buffer.ready = True
 
-            if self.save_best and eval_results:
-                key_indicator = getattr(self, 'key_indicator', self.save_best)
-                if key_indicator == 'auto':
-                    key_indicator = next(iter(eval_results))
-                    self.key_indicator = key_indicator
-                if key_indicator in eval_results:
-                    self._save_ckpt(runner, eval_results[key_indicator])
+                if self.save_best and eval_results:
+                    key_indicator = getattr(self, 'key_indicator', self.save_best)
+                    if key_indicator == 'auto':
+                        key_indicator = next(iter(eval_results))
+                        self.key_indicator = key_indicator
+                    if key_indicator in eval_results:
+                        self._save_ckpt(runner, eval_results[key_indicator])
+
+                with open(done_path, 'w') as f:
+                    f.write('done\n')
+            except Exception as e:
+                with open(fail_path, 'w') as f:
+                    f.write(repr(e))
+                raise
+        else:
+            self._wait_for_rank0_eval(runner, done_path, fail_path)

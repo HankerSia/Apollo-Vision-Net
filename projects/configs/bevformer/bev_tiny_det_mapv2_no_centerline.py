@@ -1,8 +1,11 @@
 _base_ = ['./bev_tiny_det_map_apollo.py']
 
+# Single-variable ablation: remove centerline only.
+# Keep MapTRv2 decoder, one-to-many branch, and aux-seg settings unchanged.
+
 data_root = 'data/nuscenes/'
-map_classes = ['divider', 'ped_crossing', 'boundary', 'centerline']
-map_ann_file = data_root + 'nuscenes_map_anns_val_centerline.json'
+map_classes = ['divider', 'ped_crossing', 'boundary']
+map_ann_file = 'data/nuscenes/nuscenes_map_anns_val_no_centerline.json'
 map_train_info_file = data_root + 'nuscenes_map_infos_temporal_train.pkl'
 map_val_info_file = data_root + 'nuscenes_map_infos_temporal_val.pkl'
 map_auto_prepare = dict(
@@ -19,7 +22,7 @@ map_auto_prepare = dict(
 )
 
 map_num_vec_one2one = 50
-map_num_vec_one2many = 0
+map_num_vec_one2many = 300
 map_num_pts = 20
 
 model = dict(
@@ -28,7 +31,7 @@ model = dict(
         map_num_classes=len(map_classes),
         map_num_vec_one2one=map_num_vec_one2one,
         map_num_vec_one2many=map_num_vec_one2many,
-        map_k_one2many=0,
+        map_k_one2many=6,
         map_lambda_one2many=1.0,
         num_map_vec=map_num_vec_one2one + map_num_vec_one2many,
         map_num_pts=map_num_pts,
@@ -105,5 +108,5 @@ evaluation = dict(
     interval=10,
     save_best='NuscMap_chamfer/mAP',
     rule='greater',
-    map_metric=['chamfer'],
+    map_metric=['chamfer', 'iou'],
 )

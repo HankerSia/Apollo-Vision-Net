@@ -389,17 +389,17 @@ class VectorizedLocalMap(object):
         )
 
     def get_map_geom(self, patch_box, patch_angle, layer_names, location):
-        map_geom = []
+        map_geom = {}
         for layer_name in layer_names:
             if layer_name in self.line_classes:
                 geoms = self.get_divider_line(patch_box, patch_angle, layer_name, location)
-                map_geom.append((layer_name, geoms))
+                map_geom[layer_name] = geoms
             elif layer_name in self.polygon_classes:
                 geoms = self.get_contour_line(patch_box, patch_angle, layer_name, location)
-                map_geom.append((layer_name, geoms))
+                map_geom[layer_name] = geoms
             elif layer_name in self.ped_crossing_classes:
                 geoms = self.get_ped_crossing_line(patch_box, patch_angle, location)
-                map_geom.append((layer_name, geoms))
+                map_geom[layer_name] = geoms
         return map_geom
 
     def _patch_transform(self, geom, patch_angle, patch_box):
@@ -415,20 +415,16 @@ class VectorizedLocalMap(object):
 
         records = getattr(self.map_explorer[location].map_api, layer_name)
         line_list = []
-        patch = box(
-            patch_box[0] - patch_box[3] / 2,
-            patch_box[1] - patch_box[2] / 2,
-            patch_box[0] + patch_box[3] / 2,
-            patch_box[1] + patch_box[2] / 2,
-        )
+        patch = self.map_explorer[location].get_patch_coord(patch_box, patch_angle)
         for record in records:
             line = self.map_explorer[location].map_api.extract_line(record['line_token'])
-            try:
-                line = line.intersection(patch)
-            except TopologicalError:
+            if line.is_empty:
                 continue
-            line = self._patch_transform(line, patch_angle, patch_box)
-            line_list.append(line)
+            new_line = line.intersection(patch)
+            if new_line.is_empty:
+                continue
+            new_line = self._patch_transform(new_line, patch_angle, patch_box)
+            line_list.append(new_line)
         return line_list
 
     def get_contour_line(self, patch_box, patch_angle, layer_name, location):
@@ -437,96 +433,104 @@ class VectorizedLocalMap(object):
 
         records = getattr(self.map_explorer[location].map_api, layer_name)
         polygons = []
-        patch = box(
-            patch_box[0] - patch_box[3] / 2,
-            patch_box[1] - patch_box[2] / 2,
-            patch_box[0] + patch_box[3] / 2,
-            patch_box[1] + patch_box[2] / 2,
-        )
+        patch = self.map_explorer[location].get_patch_coord(patch_box, patch_angle)
         for record in records:
-            if 'polygon_tokens' in record:
-                polys = [
+            if layer_name == 'drivable_area':
+                raw_polygons = [
                     self.map_explorer[location].map_api.extract_polygon(token)
                     for token in record['polygon_tokens']
                 ]
-                poly = ops.unary_union(polys)
             else:
-                poly = self.map_explorer[location].map_api.extract_polygon(
-                    record['polygon_token']
-                )
-            # Some nuScenes map polygons are invalid (self-intersection, etc.).
-            # Shapely may throw TopologicalError during intersection; try to
-            # repair with buffer(0) and skip if still failing.
-            try:
-                if not poly.is_valid:
-                    poly = poly.buffer(0)
-                poly = poly.intersection(patch)
-            except TopologicalError:
-                try:
-                    poly = poly.buffer(0).intersection(patch)
-                except Exception:
+                raw_polygons = [
+                    self.map_explorer[location].map_api.extract_polygon(record['polygon_token'])
+                ]
+
+            for polygon in raw_polygons:
+                if not polygon.is_valid:
                     continue
-            poly = self._patch_transform(poly, patch_angle, patch_box)
-            polygons.append(poly)
+                new_polygon = polygon.intersection(patch)
+                if new_polygon.is_empty:
+                    continue
+                new_polygon = self._patch_transform(new_polygon, patch_angle, patch_box)
+                if new_polygon.geom_type == 'Polygon':
+                    new_polygon = MultiPolygon([new_polygon])
+                polygons.append(new_polygon)
         return polygons
 
     def get_ped_crossing_line(self, patch_box, patch_angle, location):
         records = getattr(self.map_explorer[location].map_api, 'ped_crossing')
         polygons = []
-        patch = box(
-            patch_box[0] - patch_box[3] / 2,
-            patch_box[1] - patch_box[2] / 2,
-            patch_box[0] + patch_box[3] / 2,
-            patch_box[1] + patch_box[2] / 2,
-        )
+        patch = self.map_explorer[location].get_patch_coord(patch_box, patch_angle)
         for record in records:
             polygon = self.map_explorer[location].map_api.extract_polygon(record['polygon_token'])
-            try:
-                if not polygon.is_valid:
-                    polygon = polygon.buffer(0)
-                polygon = polygon.intersection(patch)
-            except TopologicalError:
-                try:
-                    polygon = polygon.buffer(0).intersection(patch)
-                except Exception:
-                    continue
-            polygon = self._patch_transform(polygon, patch_angle, patch_box)
-            polygons.append(polygon)
+            if not polygon.is_valid:
+                continue
+            new_polygon = polygon.intersection(patch)
+            if new_polygon.is_empty:
+                continue
+            new_polygon = self._patch_transform(new_polygon, patch_angle, patch_box)
+            if new_polygon.geom_type == 'Polygon':
+                new_polygon = MultiPolygon([new_polygon])
+            polygons.append(new_polygon)
         return polygons
 
     def line_geoms_to_instances(self, map_geom):
         line_instances_dict = {}
-        for layer_name, geoms in map_geom:
-            instances = []
-            for line in geoms:
-                if line.is_empty:
-                    continue
-                if line.geom_type == 'MultiLineString':
-                    for single_line in line.geoms:
-                        instances.append(single_line)
-                elif line.geom_type == 'LineString':
-                    instances.append(line)
-            line_instances_dict[layer_name] = instances
+        for layer_name, geoms in map_geom.items():
+            line_instances_dict[layer_name] = self._one_type_line_geom_to_instances(geoms)
         return line_instances_dict
 
+    def _one_type_line_geom_to_instances(self, line_geom):
+        line_instances = []
+        for line in line_geom:
+            if line.is_empty:
+                continue
+            if line.geom_type == 'MultiLineString':
+                for single_line in line.geoms:
+                    line_instances.append(single_line)
+            elif line.geom_type == 'LineString':
+                line_instances.append(line)
+            else:
+                raise NotImplementedError
+        return line_instances
+
     def ped_poly_geoms_to_instances(self, ped_geom):
-        # Represent pedestrian crossing polygons by their boundary.
-        ped_instances = []
-        for _, ped_polys in ped_geom:
-            for poly in ped_polys:
-                if poly.is_empty:
-                    continue
-                if poly.geom_type == 'MultiPolygon':
-                    for p in poly.geoms:
-                        ped_instances.append(p.exterior)
-                elif poly.geom_type == 'Polygon':
-                    ped_instances.append(poly.exterior)
-        return ped_instances
+        ped = ped_geom['ped_crossing']
+        union_segments = ops.unary_union(ped)
+        max_x = self.patch_size[1] / 2
+        max_y = self.patch_size[0] / 2
+        local_patch = box(-max_x - 0.2, -max_y - 0.2, max_x + 0.2, max_y + 0.2)
+        exteriors = []
+        interiors = []
+        if union_segments.geom_type != 'MultiPolygon':
+            union_segments = MultiPolygon([union_segments])
+        for poly in union_segments.geoms:
+            exteriors.append(poly.exterior)
+            for inter in poly.interiors:
+                interiors.append(inter)
+
+        results = []
+        for ext in exteriors:
+            if ext.is_ccw:
+                ext.coords = list(ext.coords)[::-1]
+            lines = ext.intersection(local_patch)
+            if isinstance(lines, MultiLineString):
+                lines = ops.linemerge(lines)
+            results.append(lines)
+
+        for inter in interiors:
+            if not inter.is_ccw:
+                inter.coords = list(inter.coords)[::-1]
+            lines = inter.intersection(local_patch)
+            if isinstance(lines, MultiLineString):
+                lines = ops.linemerge(lines)
+            results.append(lines)
+
+        return self._one_type_line_geom_to_instances(results)
 
     def poly_geoms_to_instances(self, polygon_geom):
-        # Convert road/lane polygons into contour line instances.
-        roads = polygon_geom[0][1]
-        lanes = polygon_geom[1][1]
+        roads = polygon_geom['road_segment']
+        lanes = polygon_geom['lane']
         union_roads = ops.unary_union(roads)
         union_lanes = ops.unary_union(lanes)
         union_segments = ops.unary_union([union_roads, union_lanes])
@@ -535,38 +539,28 @@ class VectorizedLocalMap(object):
         max_y = self.patch_size[0] / 2
         local_patch = box(-max_x + 0.2, -max_y + 0.2, max_x - 0.2, max_y - 0.2)
 
-        if union_segments.is_empty:
-            return []
         if union_segments.geom_type != 'MultiPolygon':
             union_segments = MultiPolygon([union_segments])
 
         results = []
         for poly in union_segments.geoms:
             ext = poly.exterior
+            inters = list(poly.interiors)
+            if ext.is_ccw:
+                ext.coords = list(ext.coords)[::-1]
             lines = ext.intersection(local_patch)
-            # IMPORTANT:
-            # Do NOT linemerge contour segments here. In complex junctions,
-            # `linemerge` may stitch nearby-but-unrelated segments and create
-            # polylines with large point-to-point jumps (visualized as
-            # "cross-connecting" boundaries). Keep segments split, consistent
-            # with MapTR's original implementation.
-            if lines.is_empty:
-                continue
             if isinstance(lines, MultiLineString):
-                for seg in lines.geoms:
-                    if not seg.is_empty and seg.geom_type == 'LineString':
-                        results.append(seg)
-            elif lines.geom_type == 'LineString':
+                lines = ops.linemerge(lines)
+            results.append(lines)
+
+            for inter in inters:
+                if not inter.is_ccw:
+                    inter.coords = list(inter.coords)[::-1]
+                lines = inter.intersection(local_patch)
+                if isinstance(lines, MultiLineString):
+                    lines = ops.linemerge(lines)
                 results.append(lines)
-            else:
-                # Rarely, intersection may yield GeometryCollection. Keep only LineStrings.
-                try:
-                    for g in getattr(lines, 'geoms', []):
-                        if not g.is_empty and g.geom_type == 'LineString':
-                            results.append(g)
-                except Exception:
-                    pass
-        return results
+        return self._one_type_line_geom_to_instances(results)
 
 
 @DATASETS.register_module()
@@ -818,23 +812,7 @@ class CustomNuScenesDetOccMapDataset(CustomNuScenesDataset):
             info = self.data_infos[sample_id]
             sample_token = info['token']
 
-            location = self._resolve_map_location_from_info(info)
-
-            lidar2ego = np.eye(4)
-            lidar2ego[:3, :3] = Quaternion(info['lidar2ego_rotation']).rotation_matrix
-            lidar2ego[:3, 3] = np.array(info['lidar2ego_translation'])
-
-            ego2global = np.eye(4)
-            ego2global[:3, :3] = Quaternion(info['ego2global_rotation']).rotation_matrix
-            ego2global[:3, 3] = np.array(info['ego2global_translation'])
-
-            lidar2global = ego2global @ lidar2ego
-            lidar2global_translation = list(lidar2global[:3, 3])
-            lidar2global_rotation = list(Quaternion(matrix=lidar2global).q)
-
-            anns_results = self.vector_map.gen_vectorized_samples(
-                location, lidar2global_translation, lidar2global_rotation
-            )
+            anns_results = self._get_vectormap_gt_from_info(info)
 
             gt_labels = anns_results.get('gt_vecs_label', [])
             gt_lines = []
@@ -861,6 +839,56 @@ class CustomNuScenesDetOccMapDataset(CustomNuScenesDataset):
             prog_bar.update()
 
         mmcv.dump({'GTs': gt_annos}, self.map_ann_file)
+
+    def _build_vectormap_gt_from_annotation(self, annotation: dict):
+        gt_instance = []
+        gt_labels = []
+
+        for label, cls_name in enumerate(self.MAPCLASSES):
+            for instance in annotation.get(cls_name, []) or []:
+                pts = np.asarray(instance, dtype=np.float32)
+                if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 2:
+                    continue
+                gt_instance.append(LineString(pts))
+                gt_labels.append(label)
+
+        if len(gt_instance) == 0:
+            gt_instance_lines = []
+        else:
+            gt_instance_lines = LiDARInstanceLines(
+                gt_instance,
+                self.vector_map.sample_dist,
+                self.vector_map.num_samples,
+                self.vector_map.padding,
+                self.vector_map.fixed_num,
+                self.vector_map.padding_value,
+                patch_size=self.vector_map.patch_size,
+            )
+
+        return dict(gt_vecs_pts_loc=gt_instance_lines, gt_vecs_label=gt_labels)
+
+    def _get_vectormap_gt_from_info(self, info_or_input_dict: dict):
+        annotation = info_or_input_dict.get('annotation', None)
+        if isinstance(annotation, dict):
+            return self._build_vectormap_gt_from_annotation(annotation)
+
+        location = self._resolve_map_location_from_info(info_or_input_dict)
+
+        lidar2ego = np.eye(4)
+        lidar2ego[:3, :3] = Quaternion(info_or_input_dict['lidar2ego_rotation']).rotation_matrix
+        lidar2ego[:3, 3] = np.array(info_or_input_dict['lidar2ego_translation'])
+
+        ego2global = np.eye(4)
+        ego2global[:3, :3] = Quaternion(info_or_input_dict['ego2global_rotation']).rotation_matrix
+        ego2global[:3, 3] = np.array(info_or_input_dict['ego2global_translation'])
+
+        lidar2global = ego2global @ lidar2ego
+        lidar2global_translation = list(lidar2global[:3, 3])
+        lidar2global_rotation = list(Quaternion(matrix=lidar2global).q)
+
+        return self.vector_map.gen_vectorized_samples(
+            location, lidar2global_translation, lidar2global_rotation
+        )
 
     def _resolve_map_location_from_info(self, info: dict):
         """Resolve nuScenes map location for one sample info."""
@@ -927,27 +955,13 @@ class CustomNuScenesDetOccMapDataset(CustomNuScenesDataset):
                 'Please regenerate infos with map location fields.'
             )
 
-        if location not in self.vector_map.map_explorer:
+        if location not in self.vector_map.map_explorer and 'annotation' not in input_dict:
             raise KeyError(
                 f'Unknown nuScenes map location: {location}. '
                 'Expected one of: ' + ', '.join(self.vector_map.MAPS)
             )
 
-        lidar2ego = np.eye(4)
-        lidar2ego[:3, :3] = Quaternion(input_dict['lidar2ego_rotation']).rotation_matrix
-        lidar2ego[:3, 3] = np.array(input_dict['lidar2ego_translation'])
-
-        ego2global = np.eye(4)
-        ego2global[:3, :3] = Quaternion(input_dict['ego2global_rotation']).rotation_matrix
-        ego2global[:3, 3] = np.array(input_dict['ego2global_translation'])
-
-        lidar2global = ego2global @ lidar2ego
-        lidar2global_translation = list(lidar2global[:3, 3])
-        lidar2global_rotation = list(Quaternion(matrix=lidar2global).q)
-
-        anns_results = self.vector_map.gen_vectorized_samples(
-            location, lidar2global_translation, lidar2global_rotation
-        )
+        anns_results = self._get_vectormap_gt_from_info(input_dict)
 
         gt_vecs_label = to_tensor(anns_results['gt_vecs_label'])
 
@@ -978,6 +992,8 @@ class CustomNuScenesDetOccMapDataset(CustomNuScenesDataset):
             input_dict['scene_name'] = info['scene_name']
         if 'map_location' not in input_dict and 'map_location' in info:
             input_dict['map_location'] = info['map_location']
+        if 'annotation' not in input_dict and 'annotation' in info:
+            input_dict['annotation'] = info['annotation']
         # Map GT needs lidar2ego_* to compute lidar2global.
         if 'lidar2ego_rotation' not in input_dict and 'lidar2ego_rotation' in info:
             input_dict['lidar2ego_rotation'] = info['lidar2ego_rotation']
