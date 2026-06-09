@@ -370,8 +370,36 @@ def _load_result_record(results, index: int, sample_token: str | None):
     return results[index]
 
 
-def _infer_result_index(infos, sample_token: str | None, fallback_index: int):
-    if sample_token is None or infos is None:
+def _infer_result_json_path(results_path: str):
+    if not results_path:
+        return None
+    results_dir = osp.dirname(results_path)
+    candidate = osp.join(results_dir, 'nuscmap_results.json')
+    if osp.exists(candidate):
+        return candidate
+    return None
+
+
+def _infer_result_index(infos, sample_token: str | None, fallback_index: int, results=None, results_path: str | None = None):
+    if sample_token is None:
+        return fallback_index
+
+    if isinstance(results, dict) and 'results' in results:
+        records = results['results']
+        for idx, record in enumerate(records):
+            if record.get('sample_token') == sample_token:
+                return idx
+
+    if isinstance(results, list):
+        result_json_path = _infer_result_json_path(results_path or '')
+        if result_json_path is not None:
+            result_json = mmcv.load(result_json_path)
+            records = result_json.get('results', [])
+            for idx, record in enumerate(records):
+                if record.get('sample_token') == sample_token:
+                    return idx
+
+    if infos is None:
         return fallback_index
 
     for idx, info in enumerate(infos):
@@ -412,10 +440,17 @@ def main() -> None:
         map_ann_records = mmcv.load(map_ann_file).get('GTs', [])
     results = mmcv.load(args.results)
     info = _load_info_record(infos, args.index, args.sample_token)
-    map_info = _load_info_record(map_infos, args.index, args.sample_token) if map_infos is not None else None
-    map_ann = _load_map_ann_record(map_ann_records, args.index, args.sample_token)
-    result_index = _infer_result_index(infos, args.sample_token, args.index)
-    result = _load_result_record(results, result_index, args.sample_token)
+    resolved_sample_token = args.sample_token or info.get('token')
+    map_info = _load_info_record(map_infos, args.index, resolved_sample_token) if map_infos is not None else None
+    map_ann = _load_map_ann_record(map_ann_records, args.index, resolved_sample_token)
+    result_index = _infer_result_index(
+        infos,
+        resolved_sample_token,
+        args.index,
+        results=results,
+        results_path=args.results,
+    )
+    result = _load_result_record(results, result_index, resolved_sample_token)
 
     gt_labels = np.zeros((0,), dtype=np.int64)
     gt_pts = np.zeros((0, args.fixed_pts, 2), dtype=np.float32)

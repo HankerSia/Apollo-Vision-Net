@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 """Batch-export aligned detection and map visualizations for one result folder."""
-'''
-usage:
-source /home/nuvo/anaconda3/etc/profile.d/conda.sh && conda activate apollo_vnet && cd /home/nuvo/Apollo-Vision-Net && python tools/analysis_tools/seq_det_map_vis.py --base /home/nuvo/Apollo-Vision-Net/test/bev_tiny_det_mapv2/Mon_Jun__8_14_30_54_2026 --data-root data/nuscenes --infos data/nuscenes/nuscenes_infos_temporal_val.pkl --version v1.0-trainval --scene scene-0109 --count 40 --det-out /home/nuvo/Apollo-Vision-Net/test/
-bev_tiny_det_mapv2/Mon_Jun__8_14_30_54_2026/det --map-out /home/nuvo/Apollo-Vision-Net/test/bev_tiny_det_mapv2/Mon_
-Jun__8_14_30_54_2026/map --skip-det
-scene      frames
-scene-0003 40
-scene-0012 40
-scene-0092 40
-scene-0093 39
-scene-0100 40
-scene-0101 40
-scene-0102 40
-scene-0103 40
-scene-0104 39
-scene-0105 39
-scene-0106 40
-scene-0107 40
-scene-0108 39
-scene-0109 40
-
-'''
+# usage:
+# source /home/nuvo/anaconda3/etc/profile.d/conda.sh && conda activate apollo_vnet && cd /home/nuvo/Apollo-Vision-Net && python tools/analysis_tools/seq_det_map_vis.py --base /home/nuvo/Apollo-Vision-Net/test/bev_tiny_det_mapv2/Mon_Jun__8_14_30_54_2026 --data-root data/nuscenes --infos data/nuscenes/nuscenes_infos_temporal_val.pkl --version v1.0-trainval --scene scene-0109 --count 40 --det-out /home/nuvo/Apollo-Vision-Net/test/bev_tiny_det_mapv2/Mon_Jun__8_14_30_54_2026/det --map-out /home/nuvo/Apollo-Vision-Net/test/bev_tiny_det_mapv2/Mon_Jun__8_14_30_54_2026/map --skip-det
+# scene      frames
+# scene-0003 40
+# scene-0012 40
+# scene-0092 40
+# scene-0093 39
+# scene-0100 40
+# scene-0101 40
+# scene-0102 40
+# scene-0103 40
+# scene-0104 39
+# scene-0105 39
+# scene-0106 40
+# scene-0107 40
+# scene-0108 39
+# scene-0109 40
 
 
 from __future__ import annotations
