@@ -617,6 +617,81 @@ python tools/eval_map_offline.py \
 ![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/2d8d3944654e46b1806b90c963a05571.jpeg#pic_center)
 ![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/e329f5ad5f4c4f1bae9709fb54283d52.jpeg#pic_center)
 
+### 6.4 scene-0103 地图可视化对账说明（val GT / 单帧排查 / 连续帧导出）
+
+结论先写在前面：
+
+- 对于 `bash tools/dist_test.sh projects/configs/bevformer/bev_tiny_det_mapv2.py work_dirs/bev_tiny_det_mapv2_no_one2many/mAP_epoch_100.pth 1 --eval bbox chamfer` 这条评测链，map 指标对应的 **GT** 是 `data/nuscenes/nuscenes_map_anns_val_centerline.json`。
+- 对应的 **预测** 是测试阶段落盘的 `map_results.pkl`，其内部是按 val infos 全局顺序存储的 list，每个 sample 含 `vectors/scores/labels`。
+- 当前推荐的 scene-0103 连续帧导出命令如下，它与评测链已经对齐：
+
+```bash
+source /home/nuvo/anaconda3/etc/profile.d/conda.sh && \
+conda activate apollo_vnet && \
+cd /home/nuvo/Apollo-Vision-Net && \
+python tools/analysis_tools/seq_det_map_vis.py \
+  --base /home/nuvo/Apollo-Vision-Net/test/bev_tiny_det_mapv2/Mon_Jun__8_14_30_54_2026 \
+  --data-root data/nuscenes \
+  --infos data/nuscenes/nuscenes_infos_temporal_val.pkl \
+  --version v1.0-trainval \
+  --scene scene-0103 \
+  --count 32 \
+  --det-out /home/nuvo/Apollo-Vision-Net/test/bev_tiny_det_mapv2/Mon_Jun__8_14_30_54_2026/det \
+  --map-out /home/nuvo/Apollo-Vision-Net/test/bev_tiny_det_mapv2/Mon_Jun__8_14_30_54_2026/map \
+  --skip-det
+```
+
+这条命令之所以现在是正确的，有三个关键原因：
+
+1. `seq_det_map_vis.py` 在 `--scene scene-0103` 过滤后，不再把 scene 内局部序号 `0/1/2/...` 直接当作 `map_results.pkl` 的索引；而是先从 `nuscenes_infos_temporal_val.pkl` 恢复出 val 全局索引，再传给 map 可视化子进程。
+2. `seq_det_map_vis.py` 会显式把 `data/nuscenes/nuscenes_map_anns_val_centerline.json` 传给 `vis_map_pred_single.py`，因此 val 可视化的 GT 与 map evaluator 使用的是同一份 JSON。
+3. `vis_map_pred_single.py` 在传入 `--sample-token` 时，不再只按 token 找 GT/info、却仍按默认 `index=0` 读取 list 型 `map_results.pkl`；现在会先从 infos 中解析出该 token 对应的真实 `result_index`，再读取同帧预测。
+
+之前对不上的原因，主要有两类：
+
+1. **GT 源不一致**
+  - 旧版 map 可视化优先走离线 `map_infos` 或在线矢量化逻辑，和 val map evaluator 用的 `nuscenes_map_anns_val_centerline.json` 不是同源。
+  - 这会导致“评估 mAP 对的是一套 GT，可视化画的是另一套 GT”。
+
+2. **GT 和 Pred 不是同一帧**
+  - `map_results.pkl` 是按整个 val 集顺序保存的 list。
+  - 如果把 scene 内局部帧号 `scene_frame` 直接当作 `--index`，或者只传 `--sample-token` 但旧版脚本仍按默认索引读取 list 型结果，就会出现：GT 是 token 对应的那一帧，而 Pred 却来自另一帧。
+  - 这类错位会直接表现为：ego 点看起来跑出路网、GT/Pred 严重平移、线段方向和走向完全不合理。
+
+关于下面这种手写串行代码，需要特别注意：
+
+```python
+import os
+import subprocess
+import mmcv
+
+infos = mmcv.load('data/nuscenes/nuscenes_infos_temporal_val.pkl')['infos']
+scene_infos = [(idx, info['token']) for idx, info in enumerate(infos) if info.get('scene_name') == 'scene-0103']
+out_dir = 'test/bev_tiny_det_mapv2/Mon_Jun__8_14_30_54_2026/map/scene-0103'
+os.makedirs(out_dir, exist_ok=True)
+start_frame = next(i for i, (idx, _) in enumerate(scene_infos) if idx == 927)
+for scene_frame, (idx, token) in enumerate(scene_infos[start_frame:], start=start_frame):
+   prefix = token[:8]
+   out_png = os.path.join(out_dir, f'{scene_frame:03d}_{prefix}_map.png')
+```
+
+这段思路本身没有问题，但**只有在下面两个条件同时满足时才安全**：
+
+- 传给 `vis_map_pred_single.py` 的 `--index` 必须使用上面解包得到的 **val 全局索引 `idx`**，不能使用 scene 内编号 `scene_frame`。
+- 需要显式传入 `--map-ann-file data/nuscenes/nuscenes_map_anns_val_centerline.json`，否则 GT 可能退回到离线 `map_infos` 或在线矢量化路径，重新与评测 GT 脱钩。
+
+换句话说：
+
+- `scene_frame` 只应该用于输出文件命名；
+- `idx` 才能用于从 `map_results.pkl` 中取对应预测；
+- `token` 用于标题、文件名前缀以及额外对账；
+- `map_ann_file` 用于保证 val GT 与评测完全同源。
+
+补充说明：
+
+- `NuscMap_chamfer/mAP` 是全验证集平均值，不代表某一帧肉眼一定“非常漂亮”。
+- `chamfer` 和当前 assignment 在点集层面对折线方向基本不敏感，所以单帧里“线看起来反着走”不一定意味着评估对不上；为减少这种观感误差，当前可视化脚本在显示层增加了折线方向规范化，但不会改动评测数据本身。
+
 <a id="section-7-debug"></a>
 ## 7.常见坑与排障清单
 

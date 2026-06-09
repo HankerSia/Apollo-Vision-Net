@@ -1,5 +1,6 @@
 from os import path as osp
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import mmcv
 import networkx as nx
@@ -162,6 +163,10 @@ def obtain_vectormap(nusc_maps, map_explorer, info, point_cloud_range):
     vector_map = VectorizedLocalMap(nusc_maps[location], map_explorer[location], patch_size)
     info['annotation'] = vector_map.gen_vectorized_samples(lidar2global_translation, lidar2global_rotation)
     return info
+
+
+def _attach_vectormap(nusc_maps, map_explorer, point_cloud_range, info):
+    return obtain_vectormap(nusc_maps, map_explorer, info, point_cloud_range)
 
 
 class VectorizedLocalMap(object):
@@ -471,10 +476,12 @@ def _fill_trainval_infos(
     test=False,
     max_sweeps=10,
     point_cloud_range=[-15.0, -30.0, -10.0, 15.0, 30.0, 10.0],
+    num_workers=None,
 ):
     train_nusc_infos = []
     val_nusc_infos = []
     frame_idx = 0
+    base_infos = []
     for sample in mmcv.track_iter_progress(nusc.sample):
         map_location = nusc.get('log', nusc.get('scene', sample['scene_token'])['log_token'])['location']
 
@@ -538,9 +545,33 @@ def _fill_trainval_infos(
             sd_rec = nusc.get('sample_data', sd_rec['prev'])
         info['sweeps'] = sweeps
 
-        info = obtain_vectormap(nusc_maps, map_explorer, info, point_cloud_range)
-
         if sample['scene_token'] in train_scenes:
+            base_infos.append((True, info))
+        else:
+            base_infos.append((False, info))
+
+    if num_workers is None:
+        num_workers = min(8, max(1, os.cpu_count() or 1))
+
+    if num_workers and num_workers > 1:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            infos = list(
+                executor.map(
+                    lambda item: (
+                        item[0],
+                        _attach_vectormap(nusc_maps, map_explorer, point_cloud_range, item[1]),
+                    ),
+                    base_infos,
+                )
+            )
+    else:
+        infos = [
+            (is_train, _attach_vectormap(nusc_maps, map_explorer, point_cloud_range, info))
+            for is_train, info in base_infos
+        ]
+
+    for is_train, info in infos:
+        if is_train:
             train_nusc_infos.append(info)
         else:
             val_nusc_infos.append(info)
@@ -556,6 +587,7 @@ def create_nuscenes_map_infos(
     version='v1.0-trainval',
     max_sweeps=10,
     point_cloud_range=[-15.0, -30.0, -10.0, 15.0, 30.0, 10.0],
+    num_workers=None,
 ):
     from nuscenes.can_bus.can_bus_api import NuScenesCanBus
     from nuscenes.nuscenes import NuScenes
@@ -608,6 +640,7 @@ def create_nuscenes_map_infos(
         test,
         max_sweeps=max_sweeps,
         point_cloud_range=point_cloud_range,
+        num_workers=num_workers,
     )
 
     metadata = dict(version=version)

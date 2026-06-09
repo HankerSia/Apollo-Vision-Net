@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import os.path as osp
 import sys
+from typing import Optional
 
 import mmcv
 import numpy as np
@@ -28,6 +30,7 @@ from nuscenes.nuscenes import NuScenes
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from shapely.geometry import LineString
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -175,7 +178,118 @@ def _build_lidar2global(info: dict) -> np.ndarray:
     return ego2global @ lidar2ego
 
 
-def _load_gt(vmap: VectorizedLocalMapV2, info: dict, version: str):
+def _build_gt_from_annotation(vmap: VectorizedLocalMapV2, annotation: dict):
+    gt_instances = []
+    gt_labels = []
+
+    for label, cls_name in LABEL2NAME.items():
+        for instance in annotation.get(cls_name, []) or []:
+            pts = np.asarray(instance, dtype=np.float32)
+            if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 2:
+                continue
+            gt_instances.append(LineString(pts))
+            gt_labels.append(label)
+
+    if gt_instances:
+        gt_instance_lines = LiDARInstanceLines(
+            gt_instances,
+            vmap.sample_dist,
+            vmap.num_samples,
+            vmap.padding,
+            vmap.fixed_num,
+            vmap.padding_value,
+            patch_size=vmap.patch_size,
+        )
+        pts = gt_instance_lines.fixed_num_sampled_points.cpu().numpy()
+    else:
+        pts = np.zeros((0, vmap.fixed_num, 2), dtype=np.float32)
+
+    return np.asarray(gt_labels, dtype=np.int64), pts
+
+
+def _build_gt_from_vectors(vmap: VectorizedLocalMapV2, vectors):
+    annotation = {name: [] for name in LABEL2NAME.values()}
+    for vec in vectors or []:
+        cls_name = vec.get('cls_name', None)
+        if cls_name not in annotation:
+            cls_name = LABEL2NAME.get(int(vec.get('type', -1)), None)
+        if cls_name not in annotation:
+            continue
+        annotation[cls_name].append(vec.get('pts', []))
+    return _build_gt_from_annotation(vmap, annotation)
+
+
+def _canonicalize_polyline_direction(pts: np.ndarray) -> np.ndarray:
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 2:
+        return pts
+
+    start = pts[0]
+    end = pts[-1]
+    delta = end - start
+
+    # Use the dominant axis to decide a stable display direction.
+    # This is visualization-only; evaluation remains order-invariant.
+    if abs(float(delta[0])) >= abs(float(delta[1])):
+        return pts if start[0] <= end[0] else pts[::-1]
+    return pts if start[1] <= end[1] else pts[::-1]
+
+
+def _canonicalize_polyline_set(pts: np.ndarray) -> np.ndarray:
+    if pts.ndim != 3 or pts.shape[-1] != 2:
+        return pts
+    return np.asarray([_canonicalize_polyline_direction(line) for line in pts], dtype=pts.dtype)
+
+
+def _infer_companion_map_infos_path(infos_path: str):
+    if '_map_infos_temporal_' in infos_path:
+        return infos_path if osp.exists(infos_path) else None
+    if '_infos_temporal_' not in infos_path:
+        return None
+    candidate = infos_path.replace('_infos_temporal_', '_map_infos_temporal_')
+    if osp.exists(candidate):
+        return candidate
+    return None
+
+
+def _infer_default_map_ann_path(data_root: str):
+    candidate = osp.join(data_root, 'nuscenes_map_anns_val_centerline.json')
+    if osp.exists(candidate):
+        return candidate
+    return None
+
+
+def _load_map_ann_record(map_ann_records, index: int, sample_token: str | None):
+    if map_ann_records is None:
+        return None
+
+    if sample_token is not None:
+        for record in map_ann_records:
+            if record.get('sample_token') == sample_token:
+                return record
+        return None
+
+    return map_ann_records[index]
+
+
+def _load_gt(
+    vmap: VectorizedLocalMapV2,
+    info: dict,
+    version: str,
+    map_info: Optional[dict] = None,
+    map_ann: Optional[dict] = None,
+):
+    if isinstance(map_ann, dict):
+        return _build_gt_from_vectors(vmap, map_ann.get('vectors', []))
+
+    offline_info = map_info if isinstance(map_info, dict) else None
+    annotation = None
+    if offline_info is not None:
+        annotation = offline_info.get('annotation', None)
+    if not isinstance(annotation, dict):
+        annotation = info.get('annotation', None)
+    if isinstance(annotation, dict):
+        return _build_gt_from_annotation(vmap, annotation)
+
     location = info.get('map_location', None)
     if location is None:
         scene_name = info.get('scene_name', None)
@@ -256,6 +370,16 @@ def _load_result_record(results, index: int, sample_token: str | None):
     return results[index]
 
 
+def _infer_result_index(infos, sample_token: str | None, fallback_index: int):
+    if sample_token is None or infos is None:
+        return fallback_index
+
+    for idx, info in enumerate(infos):
+        if info.get('token') == sample_token:
+            return idx
+    raise KeyError(f'sample token not found in infos: {sample_token}')
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Visualize one map prediction sample.')
     parser.add_argument('--data-root', default='data/nuscenes')
@@ -273,12 +397,25 @@ def main() -> None:
     parser.add_argument('--with-input', action='store_true')
     parser.add_argument('--input-height', type=int, default=260)
     parser.add_argument('--skip-gt', action='store_true')
+    parser.add_argument('--map-ann-file', default=None)
     args = parser.parse_args()
 
     infos = mmcv.load(args.infos)['infos'] if args.infos else None
+    map_infos = None
+    if args.infos:
+        map_infos_path = _infer_companion_map_infos_path(args.infos)
+        if map_infos_path is not None:
+            map_infos = mmcv.load(map_infos_path)['infos']
+    map_ann_records = None
+    map_ann_file = args.map_ann_file or _infer_default_map_ann_path(args.data_root)
+    if map_ann_file is not None and osp.exists(map_ann_file):
+        map_ann_records = mmcv.load(map_ann_file).get('GTs', [])
     results = mmcv.load(args.results)
     info = _load_info_record(infos, args.index, args.sample_token)
-    result = _load_result_record(results, args.index, args.sample_token)
+    map_info = _load_info_record(map_infos, args.index, args.sample_token) if map_infos is not None else None
+    map_ann = _load_map_ann_record(map_ann_records, args.index, args.sample_token)
+    result_index = _infer_result_index(infos, args.sample_token, args.index)
+    result = _load_result_record(results, result_index, args.sample_token)
 
     gt_labels = np.zeros((0,), dtype=np.int64)
     gt_pts = np.zeros((0, args.fixed_pts, 2), dtype=np.float32)
@@ -289,7 +426,7 @@ def main() -> None:
             map_classes=('divider', 'ped_crossing', 'boundary', 'centerline'),
             fixed_ptsnum_per_line=args.fixed_pts,
         )
-        gt_labels, gt_pts = _load_gt(vmap, info, args.version)
+        gt_labels, gt_pts = _load_gt(vmap, info, args.version, map_info=map_info, map_ann=map_ann)
 
     pred_labels, pred_scores, pred_pts = _load_pred(result)
 
@@ -314,15 +451,17 @@ def main() -> None:
     for i in range(len(gt_labels)):
         lab = int(gt_labels[i])
         color = LABEL2COLOR.get(lab, '#7f7f7f')
-        ax.plot(gt_pts[i, :, 0], gt_pts[i, :, 1], color=color, linewidth=1.6, alpha=0.30)
+        disp_pts = _canonicalize_polyline_direction(gt_pts[i])
+        ax.plot(disp_pts[:, 0], disp_pts[:, 1], color=color, linewidth=1.6, alpha=0.30)
 
     for i in np.where(keep)[0]:
         lab = int(pred_labels[i])
         color = LABEL2COLOR.get(lab, '#7f7f7f')
-        ax.plot(pred_pts[i, :, 0], pred_pts[i, :, 1], color=color, linewidth=2.5, alpha=0.95)
+        disp_pts = _canonicalize_polyline_direction(pred_pts[i])
+        ax.plot(disp_pts[:, 0], disp_pts[:, 1], color=color, linewidth=2.5, alpha=0.95)
         ax.text(
-            float(pred_pts[i, 0, 0]),
-            float(pred_pts[i, 0, 1]),
+            float(disp_pts[0, 0]),
+            float(disp_pts[0, 1]),
             f'{LABEL2NAME.get(lab, lab)}:{pred_scores[i]:.2f}',
             fontsize=7,
             color=color,
@@ -340,7 +479,7 @@ def main() -> None:
     ])
     ax.legend(handles=handles, loc='upper right')
     ax.set_title(
-        f"Map prediction idx={args.index} | scene={info.get('scene_name', 'n/a')} | "
+        f"Map prediction idx={result_index} | scene={info.get('scene_name', 'n/a')} | "
         f"token={str(info.get('token', 'n/a'))[:8]}...\nkept={int(keep.sum())}/{len(pred_scores)} @ score>={args.score_thr}"
     )
     fig.tight_layout()
